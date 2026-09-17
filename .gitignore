@@ -1,0 +1,26 @@
+outputs
+__pycache__/
+*.gz
+models/swin_model
+logs
+output_training
+output_evluation
+output_retraining
+train.sh
+train1.sh
+oneshot_log
+visual_result
+eval_official
+
+# Local datasets, released weights, experiment outputs, and IDE state.
+# These are intentionally not versioned with the reproducible source branch.
+dataset_and_pretrain_model/
+output_infmae*/
+output_tsar_ground/
+*.pth
+# InfMAE is an external upstream repository plus a 1.1 GB local checkpoint.
+InfMAE/
+__pycache__/
+**/__pycache__/
+.vscode/
+*.pdf

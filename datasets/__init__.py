@@ -1,0 +1,217 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+from torchvision.transforms import Compose, ToTensor, Normalize
+
+import datasets.transforms as T
+from .data_loader import TransVGDataset, MDETRCLIP
+
+""""CLIP's default transform"""
+# def _transform(n_px):
+#     return Compose([
+#         Resize(n_px, interpolation=BICUBIC),
+#         CenterCrop(n_px),
+#         _convert_image_to_rgb,
+#         ToTensor(),
+#         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+#     ])
+
+
+def make_transforms(args, image_set, is_onestage=False):
+    # COCO mean=[0.485, 0.456, 0.406,0.1], std=[0.229, 0.224, 0.225,0.2]
+    if args.modality=='rgbt':
+        if args.dataset == 'rgbtvg_flir':
+            mean,std = [0.631, 0.6401, 0.632, 0.5337], [0.2152, 0.227, 0.2439, 0.2562]#RGBT channel
+        elif args.dataset == 'rgbtvg_m3fd':
+           mean,std = [0.5013, 0.5067, 0.4923, 0.3264], [0.1948, 0.1989, 0.2117, 0.199]
+        elif args.dataset == 'rgbtvg_mfad':
+            mean,std = [0.4733, 0.4695, 0.4622, 0.3393], [0.1654, 0.1646, 0.1749, 0.2063]
+        elif args.dataset == 'rgbtvg_mixup':
+
+            mean,std = [0.5103, 0.5111, 0.502, 0.3735], [0.1926, 0.1973, 0.2091, 0.2289]
+    elif args.modality=='rgb':
+        if args.dataset == 'rgbtvg_flir':
+            mean,std = [0.631, 0.6401, 0.632], [0.2152, 0.227, 0.2439]
+        elif args.dataset == 'rgbtvg_m3fd':
+            mean,std = [0.5013, 0.5067, 0.4923], [0.1948, 0.1989, 0.2117]
+        elif args.dataset == 'rgbtvg_mfad':
+            mean,std = [0.4733, 0.4695, 0.4622], [0.1654, 0.1646, 0.1749]
+        else:
+            mean,std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    elif args.modality=='ir':
+        if args.dataset == 'rgbtvg_flir':
+            mean,std = [0.5337, 0.5337, 0.5337], [0.2562, 0.2562, 0.2562]
+        elif args.dataset == 'rgbtvg_m3fd':
+            mean,std = [0.3264, 0.3264, 0.3264], [0.199, 0.199, 0.199]
+        elif args.dataset == 'rgbtvg_mfad':
+            mean,std = [0.3393, 0.3393, 0.3393], [0.2063, 0.2063, 0.2063]
+    else:
+        mean,std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+    # SigLIP2's fixed-resolution processor expects every input channel to be
+    # normalized with mean/std 0.5.  Keep RGB-T geometric augmentation in the
+    # existing pipeline, but switch only the numeric normalization policy.
+    if getattr(args, 'image_norm', 'dataset') == 'siglip2':
+        channels = 4 if args.modality == 'rgbt' else 3
+        mean, std = [0.5] * channels, [0.5] * channels
+
+    if is_onestage:
+        normalize = Compose([
+            ToTensor(),
+            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        return normalize
+
+    imsize = args.imsize
+
+    if image_set in ['train', 'train_pseudo']:
+        scales = []
+        if args.aug_scale:
+            stride = int(imsize/8)
+            for i in range(7):
+                scales.append(imsize - stride * i)
+        else:
+            scales = [imsize]
+
+        if args.aug_crop:
+            crop_prob = 0.5
+        else:
+            crop_prob = 0.
+
+        # By default, RandomResize sets with_long_side = True. The difference lies in whether the resizing is based on
+        # the long side or the short side. Ultimately, the entire image needs to be compressed.
+        return T.Compose([
+            T.RandomSelect(
+                T.RandomResize(scales),
+                T.Compose([
+                    T.RandomResize([400, 500, 600], with_long_side=False),
+                    T.RandomSizeCrop(384, 600),
+                    T.RandomResize(scales),
+                ]),
+                p=crop_prob
+            ),
+            T.ColorJitter(0.4, 0.4, 0.4),
+            T.GaussianBlur(aug_blur=args.aug_blur),
+            # T.RandomHorizontalFlip(),  # It has a certain impact on grounding performance and needs to be turned off
+            T.ToTensor(),
+            T.NormalizeAndPad(mean=mean, std=std ,size=imsize, aug_translate=args.aug_translate)
+        ])
+
+    eval_splits = ['val', 'test', 'testA', 'testB', 'testC',
+                   "flir_val", "flir_test", "flir_testA", "flir_testB", "flir_testC",
+                   "m3fd_val", "m3fd_test", "m3fd_testA", "m3fd_testB", "m3fd_testC",
+                   "mfad_val", "mfad_test", "mfad_testA", "mfad_testB", "mfad_testC"]
+
+    # 支持条件划分的 test_ 前缀（如 test_FY/test_BG 等），统一走测试变换
+    if image_set in eval_splits or image_set.startswith('test_'):
+        return T.Compose([
+            T.RandomResize([imsize]),
+            T.ToTensor(),
+            T.NormalizeAndPad(mean=mean,std=std ,size=imsize),
+        ])
+
+    raise ValueError(f'unknown {image_set}')
+
+
+class DataAugmentationForMIM(object):
+    def __init__(self, args, image_set, is_onestage=False):
+        imsize = args.imsize
+        scales = []
+        if args.aug_scale:  # default as open
+            for i in range(6):
+                scales.append(imsize - 32 * i)
+        else:
+            scales = [imsize]
+        # scales:  [384, 352, 320, 288, 256, 224, 192], Scales are bound to be smaller than the original size.
+
+        if args.aug_crop:
+            crop_prob = 0.5
+        else:
+            crop_prob = 0.
+
+        self.common_transform = T.Compose([
+            T.RandomSelect(
+                T.RandomResize(scales),
+                T.Compose([
+                    T.RandomResize([400, 500, 600], with_long_side=False),
+                    T.RandomSizeCrop(384, 600),
+                    T.RandomResize(scales),
+                ]),
+                p=crop_prob
+            ),
+            T.ColorJitter(0.4, 0.4, 0.4),
+            T.GaussianBlur(aug_blur=args.aug_blur),
+            # T.RandomHorizontalFlip(),  # This augmentation has a certain impact on performance and needs to be turned off. (xiaolinhui)
+            # T.ToTensor(),
+            # T.NormalizeAndPad(size=imsize, aug_translate=args.aug_translate)
+        ])
+
+        self.patch_transform = T.Compose([
+            T.ToTensor(),
+            T.NormalizeAndPad_FOR_MIM(size=imsize, aug_translate=args.aug_translate)
+        ])
+
+        # self.visual_token_transform = T.Compose([
+        #     T.ToTensor(),
+        #     T.WithoutNormAndPad(size=imsize, aug_translate=args.aug_translate)
+        # ])
+
+        # This function is a mask generation function. args.num_mask_patches = 75, with a default of 75 masks.
+        # args.window_size= (224/16, 224/16)=14*14, 75/196=38%
+        """" This is the Beit 3 masking method. """
+        # self.masked_position_generator = BEIT3_MaskingGenerator(  #
+        """" This is the MAE masking method. """
+        # self.masked_position_generator = MAE_MaskingGenerator(  #
+        """" This is the our Dynamic masking method. """
+        self.masked_position_generator = Dynamic_MIM_MaskGenerator(  #
+            args.window_size, num_masking_patches=args.num_mask_patches,
+            max_num_patches=args.max_mask_patches_per_block,  # None，
+            min_num_patches=args.min_mask_patches_per_block,  # = 16
+            mim_mask_ratio=args.mim_mask_ratio,
+            dynamic_mask_ratio=args.dynamic_mask_ratio,
+        )
+
+        self.visual_target_relation_score_generator = Visual_Target_Relation_Score_Generator(args.window_size)
+
+    def __call__(self, input_dict):
+        common_transform = self.common_transform(input_dict)
+        """" Visual tokens. `for_patches` is passed to the model, which is the original input.
+         `for_visual_tokens` is passed to the tokenizer, with only the normalization step omitted. """
+        for_patches, for_visual_tokens = self.patch_transform(common_transform.copy())
+        # for_visual_tokens = self.visual_token_transform(common_transform.copy())
+        # mim_mask_pos = self.masked_position_generator()  # used for MAE，Beit3
+        mim_mask_pos = self.masked_position_generator(for_patches.copy())  # used for Dynamic_MIM_MaskGenerator
+        mim_vts_labels = self.visual_target_relation_score_generator(for_patches.copy())
+
+        return for_patches, for_visual_tokens, mim_mask_pos, mim_vts_labels
+
+
+# args.data_root default='./ln_data/', args.split_root default='data', '--dataset', default='referit'
+# split = test, testA, val, args.max_query_len = 20
+def build_dataset(split, args):
+    if hasattr(args, 'model_type') and args.model_type == 'CLIP':
+        return MDETRCLIP(args,
+                        data_root=args.data_root,
+                        split_root=args.split_root,
+                        dataset=args.dataset,
+                        split=split,
+                        transform=make_transforms(args, split),
+                        max_query_len=args.max_query_len)
+    else:
+        if hasattr(args, 'enable_ref_mim') and args.enable_ref_mim and split in ['train', 'train_pseudo']:
+            return OneRef_Dataset_with_MIM(args,
+                                           data_root=args.data_root,
+                                           split_root=args.split_root,
+                                           dataset=args.dataset,
+                                           split=split,
+                                           transform=DataAugmentationForMIM(args, split),
+                                           max_query_len=args.max_query_len,
+                                           prompt_template=args.prompt)
+        else:
+            return TransVGDataset(args,
+                                data_root=args.data_root,
+                                split_root=args.split_root,
+                                dataset=args.dataset,
+                                split=split,
+                                transform=make_transforms(args, split),
+                                max_query_len=args.max_query_len,
+                                prompt_template=args.prompt,
+                                bert_model='../dataset_and_pretrain_model/pretrain_model/pretrained_weights/Bert')

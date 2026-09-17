@@ -1,0 +1,17 @@
+diff --git a/models_infmae_skip4.py b/models_infmae_skip4.py
+index d061900..3b889e7 100644
+--- a/models_infmae_skip4.py
++++ b/models_infmae_skip4.py
+@@ -16,2 +15,0 @@ from util.pos_embed import get_2d_sincos_pos_embed
+-import torchvision.transforms.functional as F
+-import matplotlib.pyplot as plt
+diff --git a/util/pos_embed.py b/util/pos_embed.py
+index 1821450..832df7b 100644
+--- a/util/pos_embed.py
++++ b/util/pos_embed.py
+@@ -48 +48,4 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+-    omega = np.arange(embed_dim // 2, dtype=np.float)
++    # ``np.float`` was removed in NumPy 1.24.  The positional encoding is
++    # computed in the default floating-point precision, so the builtin
++    # ``float`` is the exact modern replacement.
++    omega = np.arange(embed_dim // 2, dtype=float)
