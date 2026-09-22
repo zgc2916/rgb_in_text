@@ -109,6 +109,45 @@ def test_text_conditioned_heads_and_router_shapes_and_backward():
     assert all(parameter.grad is not None for parameter in router.parameters())
 
 
+def test_text_conditioned_reliability_calibrator_is_identity_then_learns():
+    modules = _load_tsar_modules()
+    torch.manual_seed(19)
+    batch_size, patch_count, dim = 2, 196, 32
+    calibrator = modules.TextConditionedReliabilityCalibrator(
+        dim,
+        bottleneck_dim=8,
+        max_logit_shift=0.75,
+    )
+    rgb = torch.randn(batch_size, patch_count, dim, requires_grad=True)
+    tir = torch.randn(batch_size, patch_count, dim, requires_grad=True)
+    text = torch.randn(batch_size, dim, requires_grad=True)
+    base_weight = torch.sigmoid(
+        torch.randn(batch_size, patch_count, 1)
+    ).detach().requires_grad_()
+
+    calibrated, aux = calibrator(rgb, tir, text, base_weight)
+    # A zero final head leaves the established IAFv3 fusion path bitwise
+    # unchanged while still letting that head acquire a first-step gradient.
+    assert torch.equal(calibrated, base_weight)
+    assert calibrated.shape == base_weight.shape
+    assert all(torch.isfinite(value).item() for value in aux.values())
+    calibrated.square().mean().backward()
+    assert calibrator.correction_head.weight.grad is not None
+    assert torch.count_nonzero(calibrator.correction_head.weight.grad).item() > 0
+    assert calibrator.visual_projection.weight.grad is not None
+    assert torch.count_nonzero(calibrator.visual_projection.weight.grad).item() == 0
+
+    calibrator.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        calibrator.correction_head.weight.normal_(mean=0.0, std=0.02)
+    calibrated, _ = calibrator(rgb, tir, text, base_weight)
+    assert torch.all(calibrated >= 0.0)
+    assert torch.all(calibrated <= 1.0)
+    calibrated.square().mean().backward()
+    assert calibrator.visual_projection.weight.grad is not None
+    assert calibrator.text_projection.weight.grad is not None
+
+
 def test_gqr_losses_are_finite_and_teacher_does_not_backpropagate_to_boxes():
     from utils.loss_utils import gqr_ramp_scale, trans_vg_loss
 
@@ -301,6 +340,96 @@ def test_infmae_a5_target_losses_are_finite_and_only_update_tir_embeddings():
     assert rgb_teacher.grad is None
 
 
+def test_infmae_spatial_attention_loss_is_finite_and_updates_attention_only():
+    from utils.loss_utils import trans_vg_loss
+
+    torch.manual_seed(43)
+    batch_size, dim, patch_count, stages = 3, 8, 16, 4
+    args = SimpleNamespace(
+        FusionMethod='InfMAEA6SpatialFT',
+        use_contrastive_loss=False,
+        use_rtcc_constrain_loss=False,
+        use_mask_loss=False,
+        enable_gqr=False,
+        infmae_alignment_mode='both',
+        infmae_tir_text_weight=0.10,
+        infmae_rgb_tir_weight=0.05,
+        infmae_tir_text_tau=0.07,
+        infmae_alignment_start_epoch=0,
+        infmae_alignment_ramp_epochs=5,
+        infmae_rgb_tir_start_epoch=0,
+        infmae_rgb_tir_ramp_epochs=1,
+        infmae_alignment_adapter_start_epoch=0,
+        infmae_alignment_adapter_ramp_epochs=1,
+    )
+    pred_box = torch.sigmoid(torch.randn(batch_size, 4)).detach().requires_grad_()
+    target = torch.tensor(
+        [[0.50, 0.50, 0.30, 0.25], [0.35, 0.55, 0.20, 0.30], [0.65, 0.35, 0.18, 0.20]],
+        dtype=torch.float32,
+    )
+    tir_text = torch.nn.functional.normalize(torch.randn(batch_size, dim), dim=-1).detach().requires_grad_()
+    text_teacher = torch.nn.functional.normalize(torch.randn(batch_size, dim), dim=-1).detach().requires_grad_()
+    tir_rgb = torch.nn.functional.normalize(torch.randn(batch_size, dim), dim=-1).detach().requires_grad_()
+    rgb_teacher = torch.nn.functional.normalize(torch.randn(batch_size, dim), dim=-1).detach().requires_grad_()
+    attention_logits = torch.randn(batch_size, stages, patch_count, requires_grad=True)
+    attention = attention_logits.softmax(dim=-1)
+    target_distribution = torch.softmax(torch.randn(batch_size, patch_count), dim=-1)
+
+    losses = trans_vg_loss(
+        args,
+        pred_box,
+        target,
+        tgt_mask=None,
+        text_eos=None,
+        aux={
+            'tir_text_embedding': tir_text,
+            'text_embedding': text_teacher,
+            'tir_rgb_embedding': tir_rgb,
+            'rgb_embedding': rgb_teacher,
+            'infmae_spatial_attention': attention,
+            'infmae_spatial_target_distribution': target_distribution,
+        },
+        epoch=4,
+    )
+    assert torch.isfinite(losses['loss_infmae_spatial']).item()
+    assert 0.0 <= losses['infmae_spatial_target_mass'].item() <= 1.0
+    sum(value for key, value in losses.items() if key.startswith('loss_')).backward()
+    assert attention_logits.grad is not None
+    assert torch.count_nonzero(attention_logits.grad).item() > 0
+    assert text_teacher.grad is None
+    assert rgb_teacher.grad is None
+
+
+def test_infmae_spatial_mass_loss_keeps_discriminative_in_box_attention_free():
+    from utils.loss_utils import (
+        _infmae_spatial_attention_config,
+        _infmae_spatial_attention_mass_loss,
+        infmae_spatial_ramp_scale,
+    )
+
+    torch.manual_seed(47)
+    logits = torch.randn(2, 4, 16, requires_grad=True)
+    attention = logits.softmax(dim=-1)
+    target_distribution = torch.zeros(2, 16)
+    target_distribution[:, 5] = 0.8
+    target_distribution[:, 6] = 0.2
+    loss, target_mass = _infmae_spatial_attention_mass_loss(
+        attention,
+        target_distribution,
+    )
+    assert torch.isfinite(loss).item()
+    assert 0.0 <= target_mass.item() <= 1.0
+    loss.backward()
+    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad).item() > 0
+
+    args = SimpleNamespace(FusionMethod='InfMAEA6MassFT')
+    assert _infmae_spatial_attention_config(args) == ('mass', 0.005, 50, 10)
+    assert infmae_spatial_ramp_scale(args, 49) == 0.0
+    assert abs(infmae_spatial_ramp_scale(args, 50) - 0.1) < 1e-6
+    assert infmae_spatial_ramp_scale(args, 59) == 1.0
+
+
 def test_infmae_a3_alias_resolves_to_text_alignment_only():
     parser = _load_train_parser().get_args_parser()
     args = parser.parse_args(['--FusionMethod', 'InfMAEA3'])
@@ -317,6 +446,49 @@ def test_infmae_a5_bridge_alias_resolves_to_both_target_losses():
 
     from utils.loss_utils import _infmae_alignment_mode
     assert _infmae_alignment_mode(args) == 'both'
+
+
+def test_infmae_a5_bridge_ft_alias_resolves_to_both_target_losses():
+    parser = _load_train_parser().get_args_parser()
+    args = parser.parse_args(['--FusionMethod', 'InfMAEA5BridgeFT'])
+
+    from utils.loss_utils import _infmae_alignment_mode
+    assert _infmae_alignment_mode(args) == 'both'
+
+
+def test_infmae_a6_spatial_ft_alias_resolves_to_both_target_losses():
+    parser = _load_train_parser().get_args_parser()
+    args = parser.parse_args(['--FusionMethod', 'InfMAEA6SpatialFT'])
+
+    from utils.loss_utils import _infmae_alignment_mode
+    assert _infmae_alignment_mode(args) == 'both'
+
+
+def test_infmae_a6_mass_ft_alias_resolves_to_both_target_losses():
+    parser = _load_train_parser().get_args_parser()
+    args = parser.parse_args(['--FusionMethod', 'InfMAEA6MassFT'])
+
+    from utils.loss_utils import _infmae_alignment_mode
+    assert _infmae_alignment_mode(args) == 'both'
+
+
+def test_infmae_a7_hadapter_aliases_resolve_to_both_target_losses():
+    parser = _load_train_parser().get_args_parser()
+
+    from utils.loss_utils import _infmae_alignment_mode
+
+    for method in (
+        'InfMAEA7HAdapter',
+        'InfMAEA7HAdapterFT',
+        'InfMAEA7HAdapterFTStrict',
+        'InfMAEA7HAdapterF3PEFT',
+        'InfMAEA8EvidencePEFT',
+        'InfMAEA5BridgeFTTCRC',
+        'InfMAEA5BridgeFTF2',
+        'InfMAEA5BridgeFTF2PEFT',
+    ):
+        args = parser.parse_args(['--FusionMethod', method])
+        assert _infmae_alignment_mode(args) == 'both'
 
 
 def test_mmvg_gradient_accumulation_updates_once_per_group():

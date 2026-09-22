@@ -312,6 +312,17 @@ def _infmae_alignment_mode(args):
             'InfMAEA4': 'rgb_tir',
             'InfMAEA5': 'both',
             'InfMAEA5Bridge': 'both',
+            'InfMAEA5BridgeFT': 'both',
+            'InfMAEA6SpatialFT': 'both',
+            'InfMAEA6MassFT': 'both',
+            'InfMAEA7HAdapter': 'both',
+            'InfMAEA7HAdapterFT': 'both',
+            'InfMAEA7HAdapterFTStrict': 'both',
+            'InfMAEA7HAdapterF3PEFT': 'both',
+            'InfMAEA8EvidencePEFT': 'both',
+            'InfMAEA5BridgeFTTCRC': 'both',
+            'InfMAEA5BridgeFTF2': 'both',
+            'InfMAEA5BridgeFTF2PEFT': 'both',
         }.get(getattr(args, 'FusionMethod', ''), 'none')
     if mode not in {'none', 'tir_text', 'rgb_tir', 'both'}:
         raise ValueError(
@@ -364,6 +375,129 @@ def _target_aware_tir_text_infonce(tir_embedding, text_embedding, temperature):
     loss = F.cross_entropy(logits, targets)
     positive_similarity = (tir_embedding.detach() * text_embedding.detach()).sum(dim=-1).mean()
     return loss, positive_similarity, logits.shape[-1]
+
+
+def _infmae_spatial_attention_config(args):
+    """Resolve the A6 spatial objective without altering the train loop.
+
+    A6SpatialFT is retained as the original full-box KL experiment.  A6MassFT
+    uses a lower-weight in-box mass objective and starts after the RGB-to-TIR
+    curriculum has opened.  Optional attributes allow programmatic sweeps,
+    while existing A3/A5/A6 commands retain their prior behavior.
+    """
+
+    method = str(getattr(args, 'FusionMethod', ''))
+    mass_variant = method == 'InfMAEA6MassFT'
+    default_mode = 'mass' if mass_variant else 'kl'
+    default_weight = 0.005 if mass_variant else 0.02
+    default_start = 50 if mass_variant else int(
+        getattr(args, 'infmae_alignment_start_epoch', 0)
+    )
+    default_ramp = 10 if mass_variant else int(
+        getattr(args, 'infmae_alignment_ramp_epochs', 5)
+    )
+    mode = str(getattr(args, 'infmae_spatial_attention_mode', default_mode)).lower()
+    if mode not in {'kl', 'mass'}:
+        raise ValueError('--infmae_spatial_attention_mode must be kl or mass')
+    weight = float(getattr(args, 'infmae_spatial_attention_weight', default_weight))
+    if weight < 0:
+        raise ValueError('--infmae_spatial_attention_weight must be non-negative')
+    start_epoch = int(getattr(args, 'infmae_spatial_start_epoch', default_start))
+    ramp_epochs = max(
+        int(getattr(args, 'infmae_spatial_ramp_epochs', default_ramp)),
+        1,
+    )
+    return mode, weight, start_epoch, ramp_epochs
+
+
+def infmae_spatial_ramp_scale(args, epoch):
+    """Warm up A6 spatial supervision independently from A3/A5 losses."""
+
+    if epoch is None:
+        return 1.0
+    _, _, start_epoch, ramp_epochs = _infmae_spatial_attention_config(args)
+    if epoch < start_epoch:
+        return 0.0
+    return min(1.0, (epoch - start_epoch + 1) / ramp_epochs)
+
+
+def _normalize_infmae_spatial_distributions(attention, target_distribution):
+    """Validate and normalize stage-wise attention and detached box targets.
+
+    ``attention`` contains one normalized patch distribution per direct
+    InfMAE stage.  The target is a detached normalized rasterization of the
+    annotated box.  This is intentionally a training-only auxiliary loss: it
+    gives the inference-time text bridge a spatial objective without routing
+    detector predictions or GT boxes into its forward path.
+    """
+    if attention.ndim != 3:
+        raise ValueError(
+            'InfMAE spatial attention must have shape [B, stages, patches], got '
+            f'{tuple(attention.shape)}'
+        )
+    if target_distribution.ndim != 2 or target_distribution.shape != (
+        attention.shape[0], attention.shape[2]
+    ):
+        raise ValueError(
+            'InfMAE spatial target distribution must have shape [B, patches], got '
+            f'{tuple(target_distribution.shape)} for attention {tuple(attention.shape)}'
+        )
+    if not torch.isfinite(attention).all() or not torch.isfinite(target_distribution).all():
+        raise ValueError('InfMAE spatial distributions must be finite')
+    if (attention < 0).any() or (target_distribution < 0).any():
+        raise ValueError('InfMAE spatial distributions must be non-negative')
+
+    eps = torch.finfo(attention.dtype).eps
+    attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(eps)
+    target = target_distribution.detach().to(
+        device=attention.device,
+        dtype=attention.dtype,
+    )
+    target = target / target.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return attention, target, eps
+
+
+def _infmae_spatial_attention_kl(attention, target_distribution):
+    """KL(target box distribution || text-to-TIR patch attention)."""
+
+    attention, target, eps = _normalize_infmae_spatial_distributions(
+        attention,
+        target_distribution,
+    )
+    expanded_target = target[:, None, :].expand_as(attention)
+    kl_per_stage = torch.sum(
+        expanded_target
+        * (
+            expanded_target.clamp_min(eps).log()
+            - attention.clamp_min(eps).log()
+        ),
+        dim=-1,
+    )
+    target_support = target > 0
+    target_mass = (
+        attention * target_support[:, None, :].to(dtype=attention.dtype)
+    ).sum(dim=-1).mean()
+    return kl_per_stage.mean(), target_mass
+
+
+def _infmae_spatial_attention_mass_loss(attention, target_distribution):
+    """Require attention to fall inside the box without enforcing uniformity.
+
+    Referring expressions often identify a discriminative part of an object.
+    ``-log(sum_{i in box} a_i)`` retains that freedom while still penalizing
+    text-to-TIR attention that falls entirely on context/background.
+    """
+
+    attention, target, eps = _normalize_infmae_spatial_distributions(
+        attention,
+        target_distribution,
+    )
+    target_support = target > 0
+    target_mass_per_stage = (
+        attention * target_support[:, None, :].to(dtype=attention.dtype)
+    ).sum(dim=-1)
+    loss = -target_mass_per_stage.clamp_min(eps).log().mean()
+    return loss, target_mass_per_stage.mean()
 
 
 def trans_vg_loss(
@@ -579,6 +713,41 @@ def trans_vg_loss(
             losses['rgb_tir_target_similarity'] = cosine_similarity.detach().mean()
             losses['infmae_rgb_tir_ramp_scale'] = batch_pred.new_tensor(
                 rgb_tir_ramp_scale
+            )
+
+        # A6 provides its own inference-time text-to-TIR attention maps.
+        # Older A3/A5 variants do not emit these keys, so their loss surfaces
+        # and numerical behavior remain unchanged.
+        spatial_attention_key = 'infmae_spatial_attention'
+        spatial_target_key = 'infmae_spatial_target_distribution'
+        if spatial_attention_key in aux or spatial_target_key in aux:
+            missing_keys = [
+                key for key in (spatial_attention_key, spatial_target_key)
+                if key not in aux
+            ]
+            if missing_keys:
+                raise KeyError(
+                    'InfMAE spatial bridge auxiliary output is missing keys: '
+                    f'{missing_keys}'
+                )
+            spatial_mode, spatial_weight, _, _ = _infmae_spatial_attention_config(args)
+            spatial_ramp_scale = infmae_spatial_ramp_scale(args, epoch)
+            if spatial_mode == 'kl':
+                spatial_loss, target_mass = _infmae_spatial_attention_kl(
+                    aux[spatial_attention_key],
+                    aux[spatial_target_key],
+                )
+            else:
+                spatial_loss, target_mass = _infmae_spatial_attention_mass_loss(
+                    aux[spatial_attention_key],
+                    aux[spatial_target_key],
+                )
+            losses['loss_infmae_spatial'] = (
+                spatial_loss * spatial_weight * spatial_ramp_scale
+            )
+            losses['infmae_spatial_target_mass'] = target_mass.detach()
+            losses['infmae_spatial_ramp_scale'] = batch_pred.new_tensor(
+                spatial_ramp_scale
             )
 
         losses['infmae_alignment_ramp_scale'] = batch_pred.new_tensor(ramp_scale)
