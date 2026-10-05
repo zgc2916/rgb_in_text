@@ -116,6 +116,10 @@ def get_args_parser():
     parser.add_argument('--aug_crop', action='store_true', help="If true, use random crop augmentation")
     parser.add_argument('--aug_scale', action='store_true', help="If true, use multi-scale augmentation")
     parser.add_argument('--aug_translate', action='store_true', help="If true, use random translate augmentation")
+    parser.add_argument('--target_safe_crop', action='store_true',
+                        help='Accept only training crops that contain the complete referring target')
+    parser.add_argument('--target_scale_floor_pixels', default=0.0, type=float,
+                        help='Opt-in minimum training target short side when an available scale permits it')
     # only support ViT-B/16 and ViT-L/14
     parser.add_argument('--model', type=str, default='ViT-B/16', help="Name of model to be exploited.")
     parser.add_argument(
@@ -197,6 +201,8 @@ def get_args_parser():
     parser.add_argument('--normalize_before', action='store_true', help="If true, use normalize_before")
     parser.add_argument('--save_hilora_clip', action='store_true', help="If true, save hilora clip model")
     parser.add_argument('--hi_lora_stage', default=0, type=int, help='lora stage')
+    parser.add_argument('--match_infmae_lora_schedule', action='store_true',
+                        help='Train all CLIP RGB/TIR LoRA layers from epoch 0 and retain both adapters across modality switches')
     parser.add_argument('--hi_lora_retrain', default='', help='lora retrain from checkpoint')
     parser.add_argument('--hi_lora_clip', default='', type=str, help='clip model')
     parser.add_argument('--mixup_pretrain', action='store_true', help="If true, use mixup pretraining data")

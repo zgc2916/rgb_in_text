@@ -166,16 +166,31 @@ class RandomHorizontalFlip(object):
 
 
 class RandomResize(object):
-    def __init__(self, sizes, with_long_side=True):
+    def __init__(self, sizes, with_long_side=True, minimum_target_side=0.0):
         assert isinstance(sizes, (list, tuple))
         self.sizes = sizes
         self.with_long_side = with_long_side
+        self.minimum_target_side = float(minimum_target_side)
+        if self.minimum_target_side < 0:
+            raise ValueError('minimum_target_side must be non-negative')
         
     def __call__(self, input_dict):
         img = input_dict['img']
         box = input_dict['box']
         
         size = random.choice(self.sizes)
+        if self.minimum_target_side > 0:
+            short_side = float((box[2:] - box[:2]).min())
+            if short_side <= 0:
+                raise ValueError('Target-aware resizing requires a nonempty target box')
+            image_side = max(img.height, img.width) if self.with_long_side else min(img.height, img.width)
+            eligible = [candidate for candidate in self.sizes
+                        if short_side * candidate / image_side >= self.minimum_target_side]
+            # Keep the original random draw, raising only an insufficient
+            # scale. If even the largest scale cannot reach the floor, use
+            # that scale without claiming to create missing image detail.
+            minimum_size = min(eligible) if eligible else max(self.sizes)
+            size = max(size, minimum_size)
         if self.with_long_side:
             resized_img, resized_box = resize_according_to_long_side(img, box, size)
         else:
@@ -223,6 +238,30 @@ class RandomSizeCrop(object):
 
                 return input_dict
 
+        return input_dict
+
+
+class TargetPreservingSizeCrop(RandomSizeCrop):
+    """Opt-in training crop that retains the whole referring target."""
+
+    def __call__(self, input_dict):
+        img, box = input_dict['img'], input_dict['box']
+        if bool(((box[2:] - box[:2]) <= 0).any()):
+            raise ValueError('Target-preserving cropping requires a nonempty source box')
+        obj_mask = input_dict.get('obj_mask')
+        for _ in range(self.max_try):
+            w = random.randint(self.min_size, min(img.width, self.max_size))
+            h = random.randint(self.min_size, min(img.height, self.max_size))
+            region = T.RandomCrop.get_params(img, [h, w])
+            top, left, crop_h, crop_w = region
+            x0, y0, x1, y1 = box.tolist()
+            if left <= x0 and top <= y0 and x1 <= left + crop_w and y1 <= top + crop_h:
+                cropped_img, cropped_box, cropped_mask = crop(img, box, region, obj_mask)
+                input_dict['img'], input_dict['box'] = cropped_img, cropped_box
+                if obj_mask is not None:
+                    input_dict['obj_mask'] = cropped_mask
+                return input_dict
+        # Preserve the complete resized image if no valid crop was sampled.
         return input_dict
 
 

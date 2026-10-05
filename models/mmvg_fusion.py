@@ -2067,7 +2067,8 @@ class MMVGFusion(nn.Module):
         # legacy 0->5->8->12 HiLoRA schedule would freeze it for 60 epochs and
         # then partially re-freeze it again.  This branch changes no baseline
         # or GQR behavior and leaves the frozen InfMAE encoder untouched.
-        layer_limit = 12 if getattr(self, "enable_infmae_direct", False) else stage_limits[stage]
+        layer_limit = 12 if (getattr(self, "enable_infmae_direct", False)
+                             or getattr(self.args, 'match_infmae_lora_schedule', False)) else stage_limits[stage]
         for name, parameter in self.clip.named_parameters():
             is_lora_parameter = ".lora_A." in name or ".lora_B." in name
             parameter.requires_grad_(False)
@@ -2152,6 +2153,9 @@ class MMVGFusion(nn.Module):
             self._configure_infmae_tcrc_peft_tuning()
         if getattr(self, "_f2_peft_tuning_configured", False):
             self._configure_infmae_f2_peft_tuning()
+
+        if getattr(args, 'match_infmae_lora_schedule', False):
+            self._clip_control_trainability = {name: p.requires_grad for name, p in self.clip.named_parameters()}
 
         if self.open_lora and hasattr(self.clip, "print_trainable_parameters"):
             self.clip.print_trainable_parameters()
@@ -2749,13 +2753,20 @@ class MMVGFusion(nn.Module):
             return (*main_out, self._tsar_aux)
         return main_out
 
+    def _select_grounding_clip_adapter(self, name):
+        self.clip.set_adapter(name)
+        if getattr(self.args, 'match_infmae_lora_schedule', False):
+            # PEFT switches otherwise close the inactive RGB/TIR adapter before backward.
+            for parameter_name, parameter in self.clip.named_parameters():
+                parameter.requires_grad_(self._clip_control_trainability[parameter_name])
+
     def forward(self, img_data, text_data, target_boxes=None):
         # Forward-local auxiliary values are exposed only in training mode.
         # Clearing them here prevents stale tensors from a prior batch from
         # ever being returned after a feature toggle or an exception.
         self._tsar_aux = {}
         if self.open_lora:
-            self.clip.set_adapter("lora_rgb")
+            self._select_grounding_clip_adapter("lora_rgb")
         if self.args.modality =="rgbt":
             image_tensors_ir=img_data.tensors[:,3:,:,:].repeat(1,3,1,1)
             img_data_ir_mask=img_data.mask
@@ -2815,7 +2826,7 @@ class MMVGFusion(nn.Module):
         #         print(clip_image_features["hidden_states"][i][0],file=f)
         #     f.close()
         if self.open_lora:
-            self.clip.set_adapter("lora_rgb")        
+            self._select_grounding_clip_adapter("lora_rgb")
 
         vision_kwargs = {
             "adapt_layer": self.adapt_layer,
@@ -2888,7 +2899,7 @@ class MMVGFusion(nn.Module):
                     )
             else:
                 if self.open_lora:
-                    self.clip.set_adapter("lora_ir")
+                    self._select_grounding_clip_adapter("lora_ir")
                 vision_kwargs["cur_modality"] = "ir"
                 vision_kwargs["pixel_values"] = image_tensors_ir
                 clip_image_features_ir = self.clip.vision_model(**vision_kwargs)
@@ -2951,7 +2962,7 @@ class MMVGFusion(nn.Module):
                     self._tsar_aux.update(infmae_aux)
             visu_src_ir = visu_src_ir.permute(1, 0, 2)  # 197 * 4 * 512
             if self.open_lora:
-                self.clip.set_adapter("lora_rgb")
+                self._select_grounding_clip_adapter("lora_rgb")
 
         text_src = self.text_proj(text_features.float())  # B * 77 * 512
 

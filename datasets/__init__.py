@@ -76,15 +76,20 @@ def make_transforms(args, image_set, is_onestage=False):
         else:
             crop_prob = 0.
 
+        target_floor = float(getattr(args, 'target_scale_floor_pixels', 0.0))
+        crop_transform = (T.TargetPreservingSizeCrop(384, 600)
+                          if getattr(args, 'target_safe_crop', False)
+                          else T.RandomSizeCrop(384, 600))
+
         # By default, RandomResize sets with_long_side = True. The difference lies in whether the resizing is based on
         # the long side or the short side. Ultimately, the entire image needs to be compressed.
         return T.Compose([
             T.RandomSelect(
-                T.RandomResize(scales),
+                T.RandomResize(scales, minimum_target_side=target_floor),
                 T.Compose([
                     T.RandomResize([400, 500, 600], with_long_side=False),
-                    T.RandomSizeCrop(384, 600),
-                    T.RandomResize(scales),
+                    crop_transform,
+                    T.RandomResize(scales, minimum_target_side=target_floor),
                 ]),
                 p=crop_prob
             ),
