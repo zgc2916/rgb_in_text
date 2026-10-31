@@ -80,7 +80,6 @@ def make_transforms(args, image_set, is_onestage=False):
         crop_transform = (T.TargetPreservingSizeCrop(384, 600)
                           if getattr(args, 'target_safe_crop', False)
                           else T.RandomSizeCrop(384, 600))
-
         # By default, RandomResize sets with_long_side = True. The difference lies in whether the resizing is based on
         # the long side or the short side. Ultimately, the entire image needs to be compressed.
         return T.Compose([
@@ -219,4 +218,5 @@ def build_dataset(split, args):
                                 transform=make_transforms(args, split),
                                 max_query_len=args.max_query_len,
                                 prompt_template=args.prompt,
-                                bert_model='../dataset_and_pretrain_model/pretrain_model/pretrained_weights/Bert')
+                                bert_model=getattr(args, 'dataset_bert_model_path', '') or
+                                '../dataset_and_pretrain_model/pretrain_model/pretrained_weights/Bert')

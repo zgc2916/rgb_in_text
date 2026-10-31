@@ -486,6 +486,7 @@ def test_infmae_a7_hadapter_aliases_resolve_to_both_target_losses():
         'InfMAEA5BridgeFTTCRC',
         'InfMAEA5BridgeFTF2',
         'InfMAEA5BridgeFTF2PEFT',
+        'InfMAEA5BridgeFTF2GQR',
     ):
         args = parser.parse_args(['--FusionMethod', method])
         assert _infmae_alignment_mode(args) == 'both'

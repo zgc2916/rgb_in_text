@@ -5,7 +5,7 @@ import numpy as np
 import torch.nn.functional as F
 from torch import nn
 
-from utils.box_utils import bbox_iou, xywh2xyxy, xyxy2xywh, generalized_box_iou
+from utils.box_utils import bbox_iou, box_iou, xywh2xyxy, xyxy2xywh, generalized_box_iou
 from utils.misc import get_world_size, mdetr_interpolate
 try:
     from scipy.stats import spearmanr
@@ -323,6 +323,7 @@ def _infmae_alignment_mode(args):
             'InfMAEA5BridgeFTTCRC': 'both',
             'InfMAEA5BridgeFTF2': 'both',
             'InfMAEA5BridgeFTF2PEFT': 'both',
+            'InfMAEA5BridgeFTF2GQR': 'both',
         }.get(getattr(args, 'FusionMethod', ''), 'none')
     if mode not in {'none', 'tir_text', 'rgb_tir', 'both'}:
         raise ValueError(
@@ -375,6 +376,29 @@ def _target_aware_tir_text_infonce(tir_embedding, text_embedding, temperature):
     loss = F.cross_entropy(logits, targets)
     positive_similarity = (tir_embedding.detach() * text_embedding.detach()).sum(dim=-1).mean()
     return loss, positive_similarity, logits.shape[-1]
+
+
+def _confidence_weighted_rgb_transfer(tir_embedding, rgb_embedding, text_embedding, temperature):
+    """Weight the detached RGB teacher by its target-expression evidence.
+
+    Normalize over the full DDP batch so changing the sample weights does
+    not also change the nominal A4 loss coefficient. Uniform confidence
+    reproduces the ordinary mean cosine loss.
+    """
+    if temperature <= 0 or text_embedding.shape != rgb_embedding.shape:
+        raise ValueError('RGB teacher confidence requires matching embeddings and positive temperature')
+    with torch.no_grad():
+        all_text, offset = _gather_detached_candidates(text_embedding)
+        logits = rgb_embedding.detach().float() @ all_text.float().T / temperature
+        labels = torch.arange(len(rgb_embedding), device=rgb_embedding.device) + offset
+        confidence = logits.softmax(dim=-1).gather(1, labels[:, None]).squeeze(1)
+        weights = confidence.clamp_min(1.0 / logits.shape[-1])
+        weight_sum = weights.sum()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(weight_sum)
+    error = 1.0 - (tir_embedding * rgb_embedding.detach()).sum(dim=-1)
+    loss = (error * weights).sum() * get_world_size() / weight_sum.clamp_min(1e-8)
+    return loss, confidence, weights, logits.shape[-1]
 
 
 def _infmae_spatial_attention_config(args):
@@ -500,6 +524,31 @@ def _infmae_spatial_attention_mass_loss(attention, target_distribution):
     return loss, target_mass_per_stage.mean()
 
 
+def efficient_iou_loss(batch_pred, batch_target, eps=1e-7):
+    # EIoU penalizes overlap, center distance, and side-length errors.
+    pred_xyxy = xywh2xyxy(batch_pred)
+    target_xyxy = xywh2xyxy(batch_target)
+    pairwise_iou, _ = box_iou(pred_xyxy, target_xyxy)
+    iou = torch.diag(pairwise_iou)
+
+    enclosing_min = torch.minimum(pred_xyxy[:, :2], target_xyxy[:, :2])
+    enclosing_max = torch.maximum(pred_xyxy[:, 2:], target_xyxy[:, 2:])
+    enclosing_wh = (enclosing_max - enclosing_min).clamp_min(eps)
+    enclosing_diag_sq = enclosing_wh.square().sum(dim=1).clamp_min(eps)
+
+    center_dist_sq = (batch_pred[:, :2] - batch_target[:, :2]).square().sum(dim=1)
+    center_penalty = center_dist_sq / enclosing_diag_sq
+    width_penalty = (
+        (batch_pred[:, 2] - batch_target[:, 2]).square()
+        / enclosing_wh[:, 0].square().clamp_min(eps)
+    )
+    height_penalty = (
+        (batch_pred[:, 3] - batch_target[:, 3]).square()
+        / enclosing_wh[:, 1].square().clamp_min(eps)
+    )
+    return 1 - iou + center_penalty + width_penalty + height_penalty
+
+
 def trans_vg_loss(
     args,
     batch_pred,
@@ -520,18 +569,49 @@ def trans_vg_loss(
     num_boxes = batch_size
 
     loss_bbox = F.l1_loss(batch_pred, batch_target, reduction='none')
-    # torch.diag(), It means that the diagonal elements of the matrix are taken out as separate tensors
-    loss_giou = 1 - torch.diag(generalized_box_iou(
-        xywh2xyxy(batch_pred),
-        xywh2xyxy(batch_target)
-    ))
 
     losses = {}
 
-    coef1 = 2.0
-    coef2 = 2.0
+    # Keep the released 2:2 regression objective unless an experiment
+    # explicitly requests a different balance. InfMAE continuation runs use
+    # this narrow hook to test whether preserving higher-IoU boxes requires a
+    # modestly stronger GIoU gradient, without changing the data or model.
+    coef1 = float(getattr(args, 'box_l1_weight', 2.0))
+    coef2 = float(getattr(args, 'box_giou_weight', 2.0))
+    if coef1 < 0 or coef2 < 0:
+        raise ValueError('box_l1_weight and box_giou_weight must be non-negative')
     losses['loss_bbox'] = (loss_bbox.sum() / num_boxes) * coef1
-    losses['loss_giou'] = (loss_giou.sum() / num_boxes) * coef2
+    if getattr(args, 'relative_geometry_enabled', False):
+        from .relative_geometry_losses import relative_geometry_losses
+        losses.update(relative_geometry_losses(args, batch_pred, batch_target))
+    if getattr(args, 'reobserve_enabled', False):
+        if getattr(args, 'spatial_quality_enabled', False):
+            from .spatial_quality_losses import spatial_quality_losses
+            losses.update(spatial_quality_losses(args, aux, batch_target))
+        else:
+            from .reobserve_losses import reobserve_losses
+            losses.update(reobserve_losses(args, aux, batch_target))
+    box_loss_type = str(getattr(args, 'box_loss_type', 'giou')).lower()
+    if box_loss_type == 'giou':
+        loss_giou = 1 - torch.diag(generalized_box_iou(
+            xywh2xyxy(batch_pred),
+            xywh2xyxy(batch_target),
+        ))
+        losses['loss_giou'] = (loss_giou.sum() / num_boxes) * coef2
+    elif box_loss_type == 'eiou':
+        coef_eiou = float(getattr(args, 'box_eiou_weight', coef2))
+        if coef_eiou < 0:
+            raise ValueError('box_eiou_weight must be non-negative')
+        loss_eiou = efficient_iou_loss(batch_pred, batch_target)
+        losses['loss_eiou'] = (loss_eiou.sum() / num_boxes) * coef_eiou
+    else:
+        raise ValueError(f'Unsupported box_loss_type: {box_loss_type!r}')
+
+    if (getattr(args, 'infmae_local_center_only', False)
+            or getattr(args, 'infmae_bbox_head_only', False)):
+        # All other heads and alignment projectors are frozen. Optimize the
+        # same regression objective through the selected box/center head.
+        return losses
 
     if args.use_contrastive_loss:
         if isinstance(text_eos, dict):
@@ -565,6 +645,33 @@ def trans_vg_loss(
 
         losses['loss_seg_focal'] = sigmoid_focal_loss(src_mask, tgt_mask, num_boxes) * coef_focal
         losses['loss_seg_dice'] = dice_loss(src_mask, tgt_mask, num_boxes) * coef_dice
+
+    if getattr(args, 'enable_tir_detail', False) or getattr(args, 'enable_boundary_refiner', False):
+        if aux is None:
+            raise ValueError('C1 structure training requires auxiliary model output')
+        ramp = min(1.0, (0 if epoch is None else epoch + 1) / 5.0)
+        if epoch is None:
+            ramp = 1.0
+        if getattr(args, 'enable_boundary_refiner', False):
+            losses['loss_boundary_b0'] = ramp * .2 * _grounding_box_loss(aux['boundary_b0'], batch_target, num_boxes)
+            losses['loss_boundary_b1'] = ramp * .1 * _grounding_box_loss(aux['boundary_b1'], batch_target, num_boxes)
+        if getattr(args, 'enable_tir_detail', False):
+            from models.tir_detail_refine import balanced_region_bce
+            losses['loss_tir_region'] = ramp * .1 * balanced_region_bce(
+                aux['tir_region_logits'], batch_target, aux['tir_region_padding'],
+                aux.get('tir_region_valid_fraction'))
+
+    if (getattr(args, 'exchange_train_new_only', False)
+            and getattr(args, 'visual_exchange', '') not in
+            ('anchor_visual', 'anchor_text_shared', 'anchor_text_separate')):
+        if aux is None or 'exchange_correction_penalty' not in aux:
+            raise ValueError('Exchange tuning requires its training auxiliary output')
+        losses['loss_exchange_preserve'] = float(getattr(args, 'exchange_preserve_weight', .005)) * aux['exchange_correction_penalty']
+        if getattr(args, 'visual_exchange', '') != 'direction_gate':
+            if 'exchange_damage_bce' not in aux:
+                raise ValueError('Reliability tuning requires known-corruption supervision')
+            losses['loss_exchange_damage'] = float(getattr(args, 'exchange_damage_weight', .05)) * aux['exchange_damage_bce']
+            losses['exchange_perturbed_fraction'] = aux['exchange_perturbed_fraction'].detach()
 
     if aux is not None and getattr(args, 'enable_gqr', False):
         required_aux = ('rgb_aux_box', 'tir_aux_box', 'router_logits')
@@ -706,6 +813,20 @@ def trans_vg_loss(
             # accidentally turn the transfer loss into a bidirectional drift.
             cosine_similarity = (tir_embedding * rgb_embedding.detach()).sum(dim=-1)
             rgb_tir_loss = (1.0 - cosine_similarity).mean()
+            weighting = str(getattr(args, 'infmae_rgb_transfer_weighting', 'uniform'))
+            if weighting == 'semantic':
+                if 'text_embedding' not in aux:
+                    raise KeyError('Semantic RGB teacher weighting requires the detached text embedding')
+                rgb_tir_loss, confidence, weights, candidate_count = _confidence_weighted_rgb_transfer(
+                    tir_embedding, rgb_embedding, aux['text_embedding'],
+                    float(getattr(args, 'infmae_tir_text_tau', 0.07)),
+                )
+                losses['rgb_teacher_confidence'] = confidence.mean()
+                losses['rgb_teacher_weight_mean'] = weights.mean()
+                losses['rgb_teacher_weight_min'] = weights.min()
+                losses['rgb_teacher_candidate_count'] = batch_pred.new_tensor(candidate_count)
+            elif weighting != 'uniform':
+                raise ValueError(f'Unknown InfMAE RGB transfer weighting: {weighting}')
             rgb_tir_ramp_scale = infmae_rgb_tir_ramp_scale(args, epoch)
             losses['loss_infmae_rgb_tir'] = (
                 rgb_tir_loss * rgb_tir_weight * rgb_tir_ramp_scale
@@ -758,6 +879,10 @@ def trans_vg_loss(
             'semantic_bridge_gain',
             'semantic_bridge_attention_entropy',
             'semantic_bridge_attention_peak',
+            'mrp_abs_reliability_offset',
+            'mrp_abs_weight_shift',
+            'mrp_rgb_weight_base_mean',
+            'mrp_rgb_weight_mean',
         ):
             if key in aux:
                 losses[key] = aux[key].detach()

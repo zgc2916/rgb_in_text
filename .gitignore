@@ -24,3 +24,9 @@ __pycache__/
 **/__pycache__/
 .vscode/
 *.pdf
+
+# v3.0: keep local experiment artifacts and dataset symlinks out of releases.
+/output*/
+/dataset_and_pretrain_model
+.pytest_cache/
+*.py[cod]

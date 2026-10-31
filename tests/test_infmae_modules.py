@@ -846,3 +846,39 @@ def test_a5_f2_peft_opens_only_thermal_lora_and_alignment_heads():
         types.SimpleNamespace(open_lora=False, open_text_guided_fusion=False)
     )
     assert not any(parameter.requires_grad for parameter in model.clip.parameters())
+
+
+def test_f2_peak_residual_starts_as_exact_a5_f2_and_receives_gradient():
+    modules = _load_tsar_modules()
+    torch.manual_seed(71)
+    kwargs = dict(
+        f2_dim=4, f3_dim=8, token_dim=8, num_feature_levels=2,
+        bottleneck_dim=4,
+    )
+    baseline = modules.InfMAEDirectThermalAdapter(**kwargs)
+    peak = modules.InfMAEDirectThermalAdapter(
+        **kwargs, preserve_f2_peaks=True
+    )
+    missing, unexpected = peak.load_state_dict(
+        baseline.state_dict(), strict=False
+    )
+    assert missing == ["f2_peak_gate"]
+    assert unexpected == []
+
+    f2 = torch.randn(2, 4, 8, 8)
+    f3 = torch.randn(2, 8, 4, 4)
+    base_tokens, base_pooled = baseline(f2, f3)
+    peak_tokens, peak_pooled = peak(f2, f3)
+    assert all(torch.equal(a, b) for a, b in zip(base_tokens, peak_tokens))
+    assert torch.equal(base_pooled, peak_pooled)
+
+    sum(tokens.square().mean() for tokens in peak_tokens).backward()
+    assert peak.f2_peak_gate.grad is not None
+    assert torch.count_nonzero(peak.f2_peak_gate.grad) > 0
+    with torch.no_grad():
+        peak.f2_peak_gate.fill_(0.2)
+    changed_tokens, _ = peak(f2, f3)
+    assert any(
+        not torch.equal(a, b)
+        for a, b in zip(base_tokens, changed_tokens)
+    )

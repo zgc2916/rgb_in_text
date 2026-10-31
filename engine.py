@@ -15,7 +15,7 @@ from typing import Iterable
 import utils.misc as utils
 import utils.loss_utils as loss_utils
 import utils.eval_utils as eval_utils
-from utils.box_utils import xywh2xyxy
+from utils.box_utils import box_iou, generalized_box_iou, xywh2xyxy
 from utils.visual_utils import visualization
 import numpy as np
 from models.clip_mdetr import clip
@@ -134,6 +134,11 @@ def _clip_training_gradients(args, model, optimizer, max_norm):
     """
     if max_norm <= 0:
         return None
+    if getattr(args, 'clip_optimizer_groups_separately', False):
+        norms = [torch.nn.utils.clip_grad_norm_(
+            [p for p in group['params'] if p.requires_grad and p.grad is not None], max_norm)
+            for group in optimizer.param_groups]
+        return torch.stack(norms).square().sum().sqrt()
     if _infmae_adapter_only_stage(args):
         parameters = [
             parameter
@@ -149,9 +154,23 @@ def _clip_training_gradients(args, model, optimizer, max_norm):
 # TODO: 训练核心代码
 def train_one_epoch(args, model: torch.nn.Module, data_loader: Iterable,
                     optimizer: torch.optim.Optimizer, device: torch.device,
-                    epoch: int, max_norm: float = 0, start_steps: int = 0):
+                    epoch: int, max_norm: float = 0, start_steps: int = 0,
+                    teacher_model: torch.nn.Module = None):
     # 设置模型在训练模式
     model.train()
+    if getattr(args, 'infmae_local_center_only', False):
+        # Frozen weights also need deterministic dropout/normalization during
+        # training. Enable training mode only on the newly inserted head.
+        model.eval()
+        model_without_ddp = model.module if hasattr(model, 'module') else model
+        model_without_ddp.infmae_local_center.train()
+    elif getattr(args, 'infmae_bbox_head_only', False):
+        model.eval()
+        model_without_ddp = model.module if hasattr(model, 'module') else model
+        if getattr(args, 'infmae_bbox_head_last_layer_only', False):
+            model_without_ddp.bbox_embed.layers[-1].train()
+        else:
+            model_without_ddp.bbox_embed.train()
     _set_gqr_correction_scale(args, model, epoch)
     _set_infmae_alignment_adapter_scale(args, model, epoch)
     grad_accum_steps = int(getattr(args, 'grad_accum_steps', 1))
@@ -202,6 +221,14 @@ def train_one_epoch(args, model: torch.nn.Module, data_loader: Iterable,
         target = target.to(device)
         # model forward core-computer
         if 'MMVG' in args.model_name:
+            # MMVGFusion splits RGB/TIR by mutating img_data.tensors in place.
+            # Give the frozen teacher its own wrapper and tensor storage.
+            teacher_img_data = None
+            if teacher_model is not None:
+                teacher_img_data = type(img_data)(
+                    img_data.tensors.clone(),
+                    img_data.mask,
+                )
             # A3/A4/A5 use GT boxes only to form training-time target-region
             # embeddings.  Evaluation keeps the original two-input model
             # contract and therefore cannot accidentally depend on labels.
@@ -234,7 +261,67 @@ def train_one_epoch(args, model: torch.nn.Module, data_loader: Iterable,
                 aux=aux,
                 epoch=epoch,
             )
+            if getattr(args, 'infmae_local_center_only', False):
+                model_without_ddp = model.module if hasattr(model, 'module') else model
+                loss_dict.update(model_without_ddp._local_center_diagnostics)
             losses = _sum_loss_terms(loss_dict)
+
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_out = teacher_model(teacher_img_data, text_data)
+                    teacher_boxes = teacher_out[0].detach()
+                    pairwise_iou, _ = box_iou(
+                        xywh2xyxy(teacher_boxes),
+                        xywh2xyxy(target),
+                    )
+                    teacher_iou = torch.diag(pairwise_iou)
+                    preserve_mask = teacher_iou >= float(
+                        getattr(args, 'teacher_preserve_iou_threshold', 0.7)
+                    )
+
+                # Normalize by the full batch so the preservation term has a
+                # stable scale as the number of high-quality teacher boxes
+                # varies from batch to batch.
+                preserve_loss = (
+                    F.l1_loss(
+                        output[preserve_mask],
+                        teacher_boxes[preserve_mask],
+                        reduction='sum',
+                    ) / max(output.shape[0], 1)
+                    if preserve_mask.any()
+                    else output.sum() * 0.0
+                )
+                preserve_mode = getattr(args, 'teacher_preserve_mode', 'additive')
+                if preserve_mode == 'exclusive':
+                    # Easy examples retain the baseline teacher box without a
+                    # competing GT gradient.  GT regression is reserved for
+                    # examples where the baseline teacher misses IoU 0.7.
+                    hard_mask = ~preserve_mask
+                    if hard_mask.any():
+                        per_box_l1 = F.l1_loss(output, target, reduction='none').sum(dim=1)
+                        per_box_giou = 1 - torch.diag(generalized_box_iou(
+                            xywh2xyxy(output),
+                            xywh2xyxy(target),
+                        ))
+                        loss_dict['loss_bbox'] = (
+                            per_box_l1[hard_mask].sum() / max(output.shape[0], 1)
+                        ) * float(getattr(args, 'box_l1_weight', 2.0))
+                        loss_dict['loss_giou'] = (
+                            per_box_giou[hard_mask].sum() / max(output.shape[0], 1)
+                        ) * float(getattr(args, 'box_giou_weight', 2.0))
+                    else:
+                        loss_dict['loss_bbox'] = output.sum() * 0.0
+                        loss_dict['loss_giou'] = output.sum() * 0.0
+                elif preserve_mode != 'additive':
+                    raise ValueError(
+                        f'Unsupported teacher-preserve mode: {preserve_mode!r}'
+                    )
+                loss_dict['loss_teacher_preserve'] = preserve_loss * float(
+                    getattr(args, 'teacher_preserve_weight', 2.0)
+                )
+                loss_dict['teacher_preserve_fraction'] = preserve_mask.float().mean().detach()
+                loss_dict['teacher_preserve_iou'] = teacher_iou.mean().detach()
+                losses = _sum_loss_terms(loss_dict)
 
         elif args.model_name == 'FSVG':
             if getattr(args, "fs", False):
@@ -566,6 +653,16 @@ def validate(args, model: torch.nn.Module, data_loader: Iterable, device: torch.
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Eval:'
 
+    report_groups = bool(getattr(args, 'report_val_groups', False))
+    if report_groups:
+        if args.dataset != 'rgbtvg_flir' or not hasattr(data_loader.dataset, 'images'):
+            raise ValueError('Grouped validation expects the RefFLIR annotation dataset')
+        # Read the existing sampler order; the loader and its batches are unchanged.
+        annotation_indices = list(iter(data_loader.sampler))
+        annotation_offset = 0
+        group_names = ('weak', 'daylight', 'small', 'normal')
+        group_totals = torch.zeros((len(group_names), 4), device=device, dtype=torch.float64)
+
     for batch in metric_logger.log_every(data_loader, 10, header):
         if getattr(args, "model_name", None) == "AttBalance":
             img_data, text_data, target, _, _ = batch
@@ -643,9 +740,33 @@ def validate(args, model: torch.nn.Module, data_loader: Iterable, device: torch.
         if getattr(args, 'report_acc07', False):
             metric_logger.update_v2('accu_07', (miou >= 0.7).float().mean(), batch_size)
 
+        if report_groups:
+            indices = annotation_indices[annotation_offset:annotation_offset + batch_size]
+            if len(indices) != batch_size:
+                raise RuntimeError('Validation sampler and batch positions differ')
+            annotations = [data_loader.dataset.images[index] for index in indices]
+            annotation_offset += batch_size
+            weak = torch.tensor([str(row[4]) in {'1', '2'} for row in annotations], device=device)
+            small = torch.tensor([str(row[5]).lower() == 'small' for row in annotations], device=device)
+            for group_index, mask in enumerate((weak, ~weak, small, ~small)):
+                values = miou[mask].double()
+                group_totals[group_index] += torch.stack((mask.sum().double(),
+                    (values >= 0.5).sum().double(), (values >= 0.7).sum().double(), values.sum()))
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if report_groups:
+        if annotation_offset != len(annotation_indices):
+            raise RuntimeError('Grouped validation did not consume every sampler entry')
+        if utils.is_dist_avail_and_initialized():
+            dist.all_reduce(group_totals)
+        for name, (count, correct05, correct07, iou_sum) in zip(group_names, group_totals.tolist()):
+            if count <= 0:
+                raise ValueError(f'Validation group {name} contains no samples')
+            stats.update({f'count_{name}': int(count), f'accu_{name}': correct05 / count,
+                          f'accu_07_{name}': correct07 / count, f'miou_{name}': iou_sum / count})
+        print('Grouped validation:', {k: v for k, v in stats.items() if k.startswith(('count_', 'accu_', 'miou_'))})
     return stats
 
 class UnNormalize(object):

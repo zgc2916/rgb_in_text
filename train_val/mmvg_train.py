@@ -4,6 +4,7 @@ import math
 import json
 import random
 import argparse
+import copy
 import datetime
 import numpy as np
 from pathlib import Path
@@ -76,6 +77,24 @@ def _report_tsar_checkpoint_compatibility(missing_keys, unexpected_keys, *, cont
 def get_args_parser():
     parser = argparse.ArgumentParser('MMVG Training Args', add_help=False)
     parser.add_argument('--modality', default='rgbt', type=str)
+    parser.add_argument('--visual_exchange', default='lavs',
+                        choices=('lavs', 'local', 'text_local', 'global_gate', 'text_global_gate', 'text_soft_spatial',
+                                 'direction_gate', 'reliability_gate', 'reliability_spatial',
+                                 'anchor_visual', 'anchor_text_shared', 'anchor_text_separate'),
+                        help='External RGB/TIR exchange; keep internal language bridges unchanged')
+    parser.add_argument('--exchange_radii', nargs=4, type=int, default=[1, 1, 2, 3])
+    parser.add_argument('--exchange_gate_dim', type=int, default=128)
+    parser.add_argument('--anchor_count', type=int, default=16)
+    parser.add_argument('--anchor_dim', type=int, default=128)
+    parser.add_argument('--exchange_spatial_scales', nargs=3, type=float, default=[1., 2., 3.])
+    parser.add_argument('--exchange_bias_bound', type=float, default=2.)
+    parser.add_argument('--exchange_train_new_only', action='store_true',
+                        help='Freeze/eval the C1 trunk and train only the new reliability or anchor exchange')
+    parser.add_argument('--exchange_projection_tuning', action='store_true',
+                        help='Allow only existing external RGB/TIR Q/K/V/O projections to co-adapt')
+    parser.add_argument('--exchange_corruption_probability', type=float, default=.35)
+    parser.add_argument('--exchange_damage_weight', type=float, default=.05)
+    parser.add_argument('--exchange_preserve_weight', type=float, default=.005)
     parser.add_argument('--open_lora', default=True, type=str2bool)
     parser.add_argument('--open_text_guided_fusion', default=True, type=str2bool)
     # Language-Aware Visual Synergy 模式：lavs / iwm / cmx / avg
@@ -96,6 +115,10 @@ def get_args_parser():
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
+    parser.add_argument('--enable_tir_detail', action='store_true')
+    parser.add_argument('--enable_boundary_refiner', action='store_true')
+    parser.add_argument('--clip_structure_new_only', action='store_true',
+                        help='Freeze C1/eval its trunk; train only new structure modules')
     parser.add_argument('--epochs', default=90, type=int)
     parser.add_argument('--lr_power', default=0.9, type=float, help='lr poly power')
     parser.add_argument('--lr_exponential', default=0.9, type=float, help='lr exponential')
@@ -116,10 +139,6 @@ def get_args_parser():
     parser.add_argument('--aug_crop', action='store_true', help="If true, use random crop augmentation")
     parser.add_argument('--aug_scale', action='store_true', help="If true, use multi-scale augmentation")
     parser.add_argument('--aug_translate', action='store_true', help="If true, use random translate augmentation")
-    parser.add_argument('--target_safe_crop', action='store_true',
-                        help='Accept only training crops that contain the complete referring target')
-    parser.add_argument('--target_scale_floor_pixels', default=0.0, type=float,
-                        help='Opt-in minimum training target short side when an available scale permits it')
     # only support ViT-B/16 and ViT-L/14
     parser.add_argument('--model', type=str, default='ViT-B/16', help="Name of model to be exploited.")
     parser.add_argument(
@@ -201,8 +220,6 @@ def get_args_parser():
     parser.add_argument('--normalize_before', action='store_true', help="If true, use normalize_before")
     parser.add_argument('--save_hilora_clip', action='store_true', help="If true, save hilora clip model")
     parser.add_argument('--hi_lora_stage', default=0, type=int, help='lora stage')
-    parser.add_argument('--match_infmae_lora_schedule', action='store_true',
-                        help='Train all CLIP RGB/TIR LoRA layers from epoch 0 and retain both adapters across modality switches')
     parser.add_argument('--hi_lora_retrain', default='', help='lora retrain from checkpoint')
     parser.add_argument('--hi_lora_clip', default='', type=str, help='clip model')
     parser.add_argument('--mixup_pretrain', action='store_true', help="If true, use mixup pretraining data")
@@ -295,6 +312,7 @@ def get_args_parser():
     parser.add_argument('--light', dest='light', default=False, action='store_true', help='if use smaller model')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
     parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--dataset_bert_model_path', default='', type=str)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
@@ -322,6 +340,59 @@ def main(args):
     model = build_model(args)
     model.to(device)
 
+    local_center_only = bool(getattr(args, 'infmae_local_center_only', False))
+    bbox_head_only = bool(getattr(args, 'infmae_bbox_head_only', False))
+    frozen_head_only = local_center_only or bbox_head_only
+    frontend_only = bool(getattr(args, 'infmae_frontend_only', False))
+    if frontend_only:
+        if frozen_head_only or getattr(args, 'teacher_preserve_enabled', False):
+            raise ValueError('Frontend semantic tuning must be an isolated experiment')
+        if not args.resume or args.epochs > 60:
+            raise ValueError('Frontend tuning requires a fixed model-only resume and at most 60 epochs')
+        args.report_acc07 = True
+        args.report_val_groups = True
+    if bbox_head_only:
+        if local_center_only or getattr(args, 'teacher_preserve_enabled', False):
+            raise ValueError('Deterministic box-head tuning must be an isolated screen')
+        if not args.resume or args.epochs > 60:
+            raise ValueError('Box-head tuning requires a fixed --resume and at most 60 epochs')
+        args.report_acc07 = True
+        bbox_prefix = ('bbox_embed.layers.2.' if getattr(args, 'infmae_bbox_head_last_layer_only', False)
+                       else 'bbox_embed.')
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith(bbox_prefix))
+        if not any(parameter.requires_grad for parameter in model.parameters()):
+            raise RuntimeError('No bbox_embed parameters were found')
+        print(f'Deterministic box-head tuning: original model eval, optimizing {bbox_prefix}, all LoRA excluded')
+    if local_center_only:
+        args.report_acc07 = True
+        if getattr(args, 'teacher_preserve_enabled', False):
+            raise ValueError('Local center tuning cannot be combined with teacher-preserved box-head tuning')
+        if args.epochs > 60:
+            raise ValueError('Local center screens must finish before the existing HiLoRA stage changes')
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith('infmae_local_center.'))
+        if not any(parameter.requires_grad for parameter in model.parameters()):
+            raise RuntimeError('No local center refinement parameters were found')
+        print('Local center tuning: only infmae_local_center parameters update; original model runs in eval mode')
+
+    if getattr(args, 'teacher_preserve_enabled', False):
+        if 'MMVG' not in args.model_name:
+            raise ValueError('--teacher-preserve requires an MMVG model')
+        trainable_names = []
+        for name, parameter in model.named_parameters():
+            trainable = name.startswith('bbox_embed.')
+            parameter.requires_grad_(trainable)
+            if trainable:
+                trainable_names.append(name)
+        if not trainable_names:
+            raise RuntimeError('Could not find bbox_embed parameters to fine-tune')
+        print(
+            'Teacher-preserved box-head tuning: optimizing '
+            f'{sum(dict(model.named_parameters())[name].numel() for name in trainable_names)} '
+            'bbox_embed parameters'
+        )
+
     close_clip_param_update = False
     if close_clip_param_update:
         for name, param in model.clip.named_parameters():
@@ -341,7 +412,8 @@ def main(args):
     # changes their requires_grad state at stage boundaries; rebuilding or
     # re-wrapping the model there would leave the newly opened parameters out
     # of the optimizer.
-    scheduled_lora = getattr(args, 'open_lora', False) and getattr(args, 'vl_backbone', 'clip') in ('clip', 'siglip2')
+    scheduled_lora = (not frozen_head_only and not frontend_only and getattr(args, 'open_lora', False)
+                      and getattr(args, 'vl_backbone', 'clip') in ('clip', 'siglip2'))
     new_module_prefixes = (
         "gqr.",
         "gqr_eta_raw",
@@ -377,7 +449,8 @@ def main(args):
             and "textmodel" not in name
             and (
                 parameter.requires_grad
-                or (scheduled_lora and (".lora_A." in name or ".lora_B." in name))
+                or (scheduled_lora and not getattr(args, 'clip_structure_new_only', False)
+                    and (".lora_A." in name or ".lora_B." in name))
             )
         )
         if not include_parameter:
@@ -585,8 +658,17 @@ def main(args):
                                     break
                 return new_state_dict
 
-            new_checkpoint = rename_keys(checkpoint['model'])
+            # C1 is already a native RGBT checkpoint. Legacy mapping also
+            # invents base_layer keys for the ordinary VL out_proj layers;
+            # only the released common initializer needs that conversion.
+            new_checkpoint = (checkpoint['model'] if getattr(args, 'clip_structure_new_only', False)
+                              else rename_keys(checkpoint['model']))
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(new_checkpoint, strict=False)
+            if getattr(args, 'clip_structure_new_only', False):
+                from models.tir_detail_refine import NEW_MODULE_PREFIXES
+                bad_missing = [key for key in missing_keys if not key.startswith(NEW_MODULE_PREFIXES)]
+                if bad_missing or unexpected_keys:
+                    raise RuntimeError(f'C1 warm start mismatch: {bad_missing}, {unexpected_keys}')
 
             critical_missing = [key for key in missing_keys if ".base_layer." in key]
             if critical_missing:
@@ -636,12 +718,45 @@ def main(args):
         val_stats = validate(args, model, data_loader_val, device)
         best_accu = val_stats['accu']
         print("best_accu: {}".format(best_accu))
+        if (frozen_head_only or getattr(args, 'report_val_groups', False)) and args.output_dir and utils.is_main_process():
+            with open(os.path.join(args.output_dir, 'initial_validation.json'), 'w') as f:
+                json.dump(val_stats, f, indent=2)
+
+    if getattr(args, 'report_val_groups', False) and args.retrain and args.output_dir and utils.is_main_process():
+        with open(os.path.join(args.output_dir, 'initial_validation.json'), 'w') as f:
+            json.dump(val_stats, f, indent=2)
+
+    local_center_initial_stats = dict(val_stats) if frozen_head_only and args.resume else None
+    best_qualified_center_score = None
+    best_bboxhead_score = None
+    frontend_initial_stats = dict(val_stats) if frontend_only and args.resume else None
+    best_frontend_group_score = None
+
+    teacher_model = None
+    if getattr(args, 'teacher_preserve_enabled', False):
+        if not args.resume:
+            raise ValueError('--teacher-preserve requires a baseline model-only --resume checkpoint')
+        teacher_model = copy.deepcopy(model_without_ddp).to(device)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+        print('Created frozen A5-F2 teacher from the loaded baseline checkpoint.')
 
     if args.output_dir and utils.is_main_process():
         with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
             f.write(str(args) + "\n")
 
     print("Start training...")
+    if getattr(args, 'clip_structure_experiment', False):
+        # Initial validation is an audit, not a trained-epoch candidate.
+        best_accu = -float('inf')
+        if args.resume:
+            best_path = os.path.join(args.output_dir, 'best_checkpoint.pth')
+            if not os.path.isfile(best_path):
+                raise FileNotFoundError('Structure resume requires its saved best checkpoint')
+            best_record = torch.load(best_path, map_location='cpu')
+            best_accu = best_record['val_accu']
+            del best_record
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         start_ep_time = time.time()
@@ -656,7 +771,16 @@ def main(args):
         if epoch == 100:
             model_without_ddp.args.hi_lora_stage = 3
             model_without_ddp.set_HiLoRA(model_without_ddp.args)
-        train_stats = train_one_epoch(args, model, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+        train_stats = train_one_epoch(
+            args,
+            model,
+            data_loader_train,
+            optimizer,
+            device,
+            epoch,
+            args.clip_max_norm,
+            teacher_model=teacher_model,
+        )
         lr_scheduler.step()
         val_stats = validate(args, model, data_loader_val, device)
 
@@ -677,13 +801,43 @@ def main(args):
             # extra checkpoint before LR drop and every 10 epochs
             # if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 10 == 0:
                 # checkpoint_paths.append(os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
-            if val_stats['accu'] > best_accu:
+            score = (val_stats['accu'], val_stats.get('accu_07', 0), val_stats['miou'])
+            save_best = val_stats['accu'] > best_accu
+            if bbox_head_only or frontend_only:
+                save_best = best_bboxhead_score is None or score > best_bboxhead_score
+                if save_best:
+                    best_bboxhead_score = score
+            if save_best:
                 checkpoint_paths.append(os.path.join(args.output_dir, 'best_checkpoint.pth'))
-                best_accu = val_stats['accu']
+                best_accu = max(best_accu, val_stats['accu'])
                 if args.save_hilora_clip:
                     clip_checkpoint_path = os.path.join(args.output_dir, "clip_lora_stage_with_bridge.pth")
                     utils.save_on_master({"model": model_without_ddp.clip.state_dict()}, clip_checkpoint_path)
                     print("HiLoRA CLIP checkpoint saved!")
+
+            if local_center_initial_stats is not None:
+                score = (val_stats['accu'], val_stats['accu_07'], val_stats['miou'])
+                qualifies = (score[0] >= 463 / 608
+                             and score[1] >= local_center_initial_stats['accu_07']
+                             and score[2] >= local_center_initial_stats['miou'])
+                if qualifies and (best_qualified_center_score is None or score > best_qualified_center_score):
+                    checkpoint_paths.append(os.path.join(args.output_dir, 'qualified_checkpoint.pth'))
+                    best_qualified_center_score = score
+
+            if frontend_initial_stats is not None:
+                initial = frontend_initial_stats
+                quality_preserved = (val_stats['accu'] >= initial['accu']
+                                     and val_stats['accu_07'] >= initial['accu_07']
+                                     and val_stats['miou'] >= initial['miou'])
+                group_preserved = all(val_stats[f'accu_{g}'] >= initial[f'accu_{g}'] for g in ('weak', 'small'))
+                group_improved = any(round(val_stats[f'accu_{g}'] * val_stats[f'count_{g}'])
+                                     >= round(initial[f'accu_{g}'] * initial[f'count_{g}']) + 2
+                                     for g in ('weak', 'small'))
+                group_score = ((val_stats['accu_weak'] + val_stats['accu_small']) / 2, *score)
+                if quality_preserved and group_preserved and group_improved and (
+                        best_frontend_group_score is None or group_score > best_frontend_group_score):
+                    checkpoint_paths.append(os.path.join(args.output_dir, 'best_group_checkpoint.pth'))
+                    best_frontend_group_score = group_score
 
             for checkpoint_path in checkpoint_paths:
                 print('Checkpoint is saving to: ', str(checkpoint_path))
@@ -693,7 +847,10 @@ def main(args):
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
-                    'val_accu': val_stats['accu']
+                    'val_accu': val_stats['accu'],
+                    'val_accu_07': val_stats.get('accu_07'),
+                    'val_miou': val_stats.get('miou'),
+                    'val_stats': val_stats,
                 }, checkpoint_path)
             print('Checkpoints have been saved!')
 

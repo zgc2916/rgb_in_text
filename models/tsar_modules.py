@@ -412,6 +412,139 @@ class TextConditionedReliabilityCalibrator(nn.Module):
         }
 
 
+class ModalityReliabilityPerturbation(nn.Module):
+    """Apply a bounded, sample-level correction to IAFv3's modality prior.
+
+    Unlike TCRC, this module has no text input and does not make a separate
+    patch-level decision. It summarizes the RGB and TIR features before LAVS,
+    predicts one relative reliability offset per image, and applies that
+    offset to IAFv3's post-LAVS RGB weight. The zero-initialized correction
+    head makes the initial result exactly equal to IAFv3; max_reliability_offset
+    bounds how far training can move the prior.
+    """
+
+    def __init__(
+        self,
+        frontend_dim: int,
+        bottleneck_dim: int | None = None,
+        max_reliability_offset: float = 0.5,
+    ):
+        super().__init__()
+        if int(frontend_dim) <= 0:
+            raise ValueError(f"frontend_dim must be positive, got {frontend_dim}")
+        if bottleneck_dim is None:
+            bottleneck_dim = max(int(frontend_dim) // 8, 1)
+        if int(bottleneck_dim) <= 0:
+            raise ValueError(
+                f"bottleneck_dim must be positive, got {bottleneck_dim}"
+            )
+        if not 0.0 < float(max_reliability_offset) <= 1.0:
+            raise ValueError("max_reliability_offset must be in (0, 1]")
+
+        self.frontend_dim = int(frontend_dim)
+        self.bottleneck_dim = int(bottleneck_dim)
+        self.max_reliability_offset = float(max_reliability_offset)
+        self.rgb_norm = nn.LayerNorm(self.frontend_dim)
+        self.tir_norm = nn.LayerNorm(self.frontend_dim)
+
+        # Three D-dimensional pooled descriptors plus five scalar statistics:
+        # per-modality dispersion, cross-modal agreement, and IAFv3's mean
+        # weight/uncertainty. No language or annotation signal is consumed.
+        context_dim = self.frontend_dim * 3 + 5
+        self.context_norm = nn.LayerNorm(context_dim)
+        self.context_mlp = nn.Sequential(
+            nn.Linear(context_dim, self.bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(self.bottleneck_dim, self.bottleneck_dim),
+            nn.GELU(),
+        )
+        self.correction_head = nn.Linear(self.bottleneck_dim, 1)
+        nn.init.zeros_(self.correction_head.weight)
+        nn.init.zeros_(self.correction_head.bias)
+
+    def forward(
+        self,
+        rgb_frontend_tokens: torch.Tensor,
+        tir_frontend_tokens: torch.Tensor,
+        base_rgb_weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Return calibrated [B, N, 1] weights and training diagnostics."""
+
+        if (
+            rgb_frontend_tokens.ndim != 3
+            or tir_frontend_tokens.ndim != 3
+            or rgb_frontend_tokens.shape != tir_frontend_tokens.shape
+            or rgb_frontend_tokens.shape[-1] != self.frontend_dim
+        ):
+            raise ValueError(
+                "Pre-LAVS RGB/TIR tokens must have matching [B, N, D] shapes, "
+                f"got RGB={tuple(rgb_frontend_tokens.shape)}, "
+                f"TIR={tuple(tir_frontend_tokens.shape)}"
+            )
+        batch_size = rgb_frontend_tokens.shape[0]
+        if (
+            base_rgb_weight.ndim != 3
+            or base_rgb_weight.shape[0] != batch_size
+            or base_rgb_weight.shape[-1] != 1
+        ):
+            raise ValueError(
+                "base_rgb_weight must have shape [B, N, 1], got "
+                f"{tuple(base_rgb_weight.shape)}"
+            )
+
+        rgb = self.rgb_norm(rgb_frontend_tokens.float())
+        tir = self.tir_norm(tir_frontend_tokens.float())
+        rgb_mean = rgb.mean(dim=1)
+        tir_mean = tir.mean(dim=1)
+        rgb_dispersion = (rgb - rgb_mean.unsqueeze(1)).abs().mean(
+            dim=(1, 2), keepdim=False
+        ).unsqueeze(-1)
+        tir_dispersion = (tir - tir_mean.unsqueeze(1)).abs().mean(
+            dim=(1, 2), keepdim=False
+        ).unsqueeze(-1)
+        agreement = F.cosine_similarity(rgb_mean, tir_mean, dim=-1).unsqueeze(-1)
+
+        base_weight = base_rgb_weight.float()
+        base_mean = base_weight.mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        base_uncertainty = (
+            4.0 * base_weight * (1.0 - base_weight)
+        ).mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        context = torch.cat(
+            (
+                rgb_mean,
+                tir_mean,
+                torch.abs(rgb_mean - tir_mean),
+                rgb_dispersion,
+                tir_dispersion,
+                agreement,
+                base_mean,
+                base_uncertainty,
+            ),
+            dim=-1,
+        )
+        correction = self.max_reliability_offset * torch.tanh(
+            self.correction_head(
+                self.context_mlp(self.context_norm(context))
+            )
+        )
+
+        # Since |correction| <= 1, w + w(1-w) * correction remains in
+        # [0, 1], while correction == 0 preserves the original weight exactly.
+        calibrated_weight = (
+            base_weight
+            + base_weight * (1.0 - base_weight) * correction.unsqueeze(1)
+        ).to(dtype=base_rgb_weight.dtype)
+        return calibrated_weight, {
+            "mrp_abs_reliability_offset": correction.detach().abs().mean(),
+            "mrp_abs_weight_shift": (
+                calibrated_weight.detach().float()
+                - base_rgb_weight.detach().float()
+            ).abs().mean(),
+            "mrp_rgb_weight_base_mean": base_weight.detach().mean(),
+            "mrp_rgb_weight_mean": calibrated_weight.detach().float().mean(),
+        }
+
+
 def _load_infmae_factory():
     """Load the user-supplied InfMAE implementation without copying it.
 
@@ -1457,6 +1590,7 @@ class InfMAEDirectThermalAdapter(nn.Module):
         num_feature_levels: int = 4,
         bottleneck_dim: int = 192,
         f2_scale_init: float = 0.10,
+        preserve_f2_peaks: bool = False,
     ):
         super().__init__()
         if min(f2_dim, f3_dim, token_dim, num_feature_levels, bottleneck_dim) <= 0:
@@ -1497,6 +1631,14 @@ class InfMAEDirectThermalAdapter(nn.Module):
         nn.init.zeros_(self.cls_projection.bias)
         f2_logit = math.log(f2_scale_init / (1.0 - f2_scale_init))
         self.f2_scale_raw = nn.Parameter(torch.tensor(f2_logit))
+        # The optional F2 path retains the strongest 2x2 local responses.
+        # Zero gate exactly reproduces the trained A5-F2 interpolation at
+        # initialization, allowing a controlled warm-start experiment.
+        self.f2_peak_gate = (
+            nn.Parameter(torch.zeros(1, self.token_dim, 1, 1))
+            if preserve_f2_peaks
+            else None
+        )
 
     @staticmethod
     def _map_to_tokens(feature_map: torch.Tensor) -> torch.Tensor:
@@ -1541,19 +1683,27 @@ class InfMAEDirectThermalAdapter(nn.Module):
         f2_projected = self._project_map(f2, self.f2_proj, self.f2_norm)
         f3_projected = self._project_map(f3, self.f3_proj, self.f3_norm)
         target_hw = f3_projected.shape[-2:]
+        f2_detail_residual = None
         if f2_projected.shape[-2:] != target_hw:
-            f2_projected = torch.nn.functional.interpolate(
+            f2_bilinear = torch.nn.functional.interpolate(
                 f2_projected,
                 size=target_hw,
                 mode="bilinear",
                 align_corners=False,
             )
+            if self.f2_peak_gate is not None:
+                if f2_projected.shape[-2:] != (2 * target_hw[0], 2 * target_hw[1]):
+                    raise ValueError("F2 peak path expects a 2x F3 grid")
+                f2_peak = F.max_pool2d(f2_projected, kernel_size=2, stride=2)
+                f2_detail_residual = torch.tanh(self.f2_peak_gate) * (
+                    f2_peak - f2_bilinear
+                )
+            f2_projected = f2_bilinear
 
-        base_patches = self.fusion_norm(
-            self._map_to_tokens(
-                f3_projected + torch.sigmoid(self.f2_scale_raw) * f2_projected
-            )
-        )
+        fused_map = f3_projected + torch.sigmoid(self.f2_scale_raw) * f2_projected
+        if f2_detail_residual is not None:
+            fused_map = fused_map + f2_detail_residual
+        base_patches = self.fusion_norm(self._map_to_tokens(fused_map))
         pooled = base_patches.mean(dim=1)
         base_cls = self.cls_projection(pooled).unsqueeze(1) + self.cls_token
 

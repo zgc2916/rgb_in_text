@@ -18,6 +18,15 @@ import math
 import re
 from pathlib import Path
 
+from .infmae_local_center import InfMAELocalCenterRefiner
+from .local_modal_exchange import LocalModalExchange
+from .soft_spatial_exchange import SoftSpatialModalExchange
+from .region_anchor_exchange import RegionAnchorExchange, MODES as ANCHOR_EXCHANGE_MODES
+from .reliable_modal_exchange import ReliableModalExchange, MODES as RELIABLE_EXCHANGE_MODES, corrupt_modalities
+from .tir_detail_refine import (TIRDetailEncoder, TextLocalTIRInjector,
+                                TextRegionHead, BoundaryRefiner, NEW_MODULE_PREFIXES,
+                                parameter_report, resize_padding)
+
 from .tsar_modules import (
     FrozenInfMAEEncoder,
     GroundingQualityRouter,
@@ -29,6 +38,7 @@ from .tsar_modules import (
     TargetAwareTokenPool,
     TargetFeatureProjector,
     TextConditionedReliabilityCalibrator,
+    ModalityReliabilityPerturbation,
     TextGuidedThermalSemanticBridge,
     TextGuidedThermalSpatialBridge,
     TextConditionedModalityHead,
@@ -854,6 +864,10 @@ class MMVGFusion(nn.Module):
         # stage while retaining the original A5BridgeFT joint-training
         # contract.  ``InfMAEA5BridgeFTF2PEFT`` is its stricter ablation: only
         # the thermal representation and its existing alignment heads train.
+        # ``InfMAEA5BridgeFTF2GQR`` keeps the proven full-training frontend and
+        # adds GQR at the existing IAFv3 fusion boundary. InfMAEA5BridgeFTF2MRP
+        # instead applies a bounded, sample-level prior from pre-LAVS RGB/TIR
+        # feature quality without text or GT. Both remain opt-in aliases.
         self.fusion_method = getattr(args, "FusionMethod", "concat")
         self.enable_infmae_hybrid = self.fusion_method == "GQRv1InfMAE"
         self._infmae_direct_fusion_methods = {
@@ -871,8 +885,10 @@ class MMVGFusion(nn.Module):
             "InfMAEA7HAdapterF3PEFT",
             "InfMAEA8EvidencePEFT",
             "InfMAEA5BridgeFTTCRC",
-            "InfMAEA5BridgeFTF2",
+            "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak",
             "InfMAEA5BridgeFTF2PEFT",
+            "InfMAEA5BridgeFTF2GQR",
+            "InfMAEA5BridgeFTF2MRP",
         }
         self.enable_infmae_direct = self.fusion_method in self._infmae_direct_fusion_methods
         self.enable_infmae_semantic_bridge = self.fusion_method in {
@@ -886,8 +902,10 @@ class MMVGFusion(nn.Module):
             "InfMAEA7HAdapterF3PEFT",
             "InfMAEA8EvidencePEFT",
             "InfMAEA5BridgeFTTCRC",
-            "InfMAEA5BridgeFTF2",
+            "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak",
             "InfMAEA5BridgeFTF2PEFT",
+            "InfMAEA5BridgeFTF2GQR",
+            "InfMAEA5BridgeFTF2MRP",
         }
         self.enable_infmae_late_lora = self.fusion_method in {
             "InfMAEA5BridgeFT",
@@ -897,8 +915,10 @@ class MMVGFusion(nn.Module):
             "InfMAEA7HAdapterFTStrict",
             "InfMAEA7HAdapterF3PEFT",
             "InfMAEA5BridgeFTTCRC",
-            "InfMAEA5BridgeFTF2",
+            "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak",
             "InfMAEA5BridgeFTF2PEFT",
+            "InfMAEA5BridgeFTF2GQR",
+            "InfMAEA5BridgeFTF2MRP",
         }
         self.enable_infmae_spatial_bridge = self.fusion_method in {
             "InfMAEA6SpatialFT",
@@ -923,12 +943,20 @@ class MMVGFusion(nn.Module):
         self.enable_infmae_text_reliability_calibration = (
             self.fusion_method == "InfMAEA5BridgeFTTCRC"
         )
+        self.enable_infmae_modality_reliability_perturbation = (
+            self.fusion_method == "InfMAEA5BridgeFTF2MRP"
+        )
         self.enable_infmae_f2_lora = self.fusion_method in {
-            "InfMAEA5BridgeFTF2",
+            "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak",
             "InfMAEA5BridgeFTF2PEFT",
+            "InfMAEA5BridgeFTF2GQR",
+            "InfMAEA5BridgeFTF2MRP",
         }
         self.enable_infmae_f2_peft_tuning = (
             self.fusion_method == "InfMAEA5BridgeFTF2PEFT"
+        )
+        self.enable_infmae_f2_peak = (
+            self.fusion_method == "InfMAEA5BridgeFTF2Peak"
         )
         self.infmae_alignment_mode = self._resolve_infmae_alignment_mode(args)
         self.enable_infmae_tir_text_alignment = self.infmae_alignment_mode in {
@@ -1000,7 +1028,8 @@ class MMVGFusion(nn.Module):
         else:  # default base model
             print("init CLIP ViT-B/16")
             # self.clip = CLIPModel.from_pretrained("/home/shared/pretrain_model/pretrained_weights/CLIP/clip-vit-base-patch16")
-            self.clip = CLIPModel.from_pretrained("../dataset_and_pretrain_model/pretrain_model/pretrained_weights/CLIP/clip-vit-base-patch16")
+            clip_path = getattr(args, 'pretrained_model_path', '') or "../dataset_and_pretrain_model/pretrain_model/pretrained_weights/CLIP/clip-vit-base-patch16"
+            self.clip = CLIPModel.from_pretrained(clip_path)
             """
              Note that there is no mistake here. Note that [1, 4, 8, 12], [0, 3, 7, 11] are the same layer.
              In the internal implementation of transformers, the index at vision branch [0] is the original
@@ -1083,12 +1112,16 @@ class MMVGFusion(nn.Module):
         # ``GQRv1InfMAE`` is deliberately a distinct fusion setting rather
         # than changing GQRv1 in-place.  Existing GQR checkpoints/runs retain
         # their exact architecture and the InfMAE path is opt-in.
-        self._gqr_fusion_methods = {"GQRv1", "GQRv1InfMAE"}
+        self._gqr_fusion_methods = {
+            "GQRv1",
+            "GQRv1InfMAE",
+            "InfMAEA5BridgeFTF2GQR",
+        }
         if self.enable_gqr and self.args.modality != "rgbt":
             raise ValueError("--enable_gqr requires --modality rgbt")
         if self.enable_gqr and self.fusion_method not in self._gqr_fusion_methods:
             raise ValueError(
-                "--enable_gqr requires --FusionMethod GQRv1 or GQRv1InfMAE"
+                "--enable_gqr requires a GQR-enabled FusionMethod"
             )
         if self.fusion_method in self._gqr_fusion_methods and not self.enable_gqr:
             raise ValueError(
@@ -1101,10 +1134,14 @@ class MMVGFusion(nn.Module):
                 "The supplied InfMAE checkpoint supports 224x224 inputs only; "
                 f"got --imsize {self.imsize}."
             )
-        if self.enable_infmae_direct and self.enable_gqr:
+        if (
+            self.enable_infmae_direct
+            and self.enable_gqr
+            and self.fusion_method != "InfMAEA5BridgeFTF2GQR"
+        ):
             raise ValueError(
                 "Direct InfMAE A2/A3/A4/A5 modes are independent of GQR; "
-                "remove --enable_gqr."
+                "use InfMAEA5BridgeFTF2GQR or remove --enable_gqr."
             )
         if self.enable_infmae_alignment and not self.enable_infmae_direct:
             raise ValueError(
@@ -1202,6 +1239,173 @@ class MMVGFusion(nn.Module):
         self._configure_infmae_a8_evidence_peft_tuning()
         self._configure_infmae_tcrc_peft_tuning()
         self._configure_infmae_f2_peft_tuning()
+        self.infmae_local_center = None
+        if getattr(args, "infmae_local_center_only", False):
+            if self.fusion_method != "InfMAEA5BridgeFTF2":
+                raise ValueError("Local center refinement requires the fixed A5-F2 frontend")
+            self.infmae_local_center = InfMAELocalCenterRefiner(
+                self.infmae_direct_encoder.f2_dim,
+                self.hidden_dim,
+                image_size=args.imsize,
+                max_shift_pixels=getattr(args, "infmae_local_center_max_shift_pixels", 4.0),
+            )
+            print("Enabled zero-init InfMAE F2 local center refinement")
+
+        self._infmae_frontend_training = False
+        self._configure_a5_frontend_tuning()
+        self.enable_tir_detail = bool(getattr(args, 'enable_tir_detail', False))
+        self.enable_boundary_refiner = bool(getattr(args, 'enable_boundary_refiner', False))
+        self._clip_structure_training = False
+        if self.enable_tir_detail or self.enable_boundary_refiner:
+            if (self.fusion_method != 'IAFv3' or args.modality != 'rgbt'
+                    or args.imsize != 224 or self.is_siglip2
+                    or self.patch_size != 16 or str(args.model) != 'ViT-B/16'
+                    or self.backbone_visual_dim != 768 or self.hidden_dim != 512
+                    or len(self.extract_vision_layer) != 4):
+                raise ValueError('C1 detail/refiner requires CLIP ViT-B/16, RGBT, IAFv3 and 224 input')
+            # Preserve original model/RNG initialization across all four variants.
+            with torch.random.fork_rng(devices=[]):
+                if self.enable_tir_detail:
+                    self.tir_detail = TIRDetailEncoder()
+                    self.tir_injector = TextLocalTIRInjector()
+                    self.tir_region_head = TextRegionHead()
+                if self.enable_boundary_refiner:
+                    self.boundary_refiner = BoundaryRefiner(with_detail=self.enable_tir_detail)
+            print('C1 architecture parameters:', parameter_report(self))
+        if getattr(args, 'clip_structure_new_only', False):
+            if not (self.enable_tir_detail or self.enable_boundary_refiner):
+                raise ValueError('New-only exploration requires at least one new module')
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(name.startswith(NEW_MODULE_PREFIXES))
+
+        self.visual_exchange_mode = getattr(args, 'visual_exchange', 'lavs')
+        if self.visual_exchange_mode not in ('lavs', 'local', 'text_local', 'global_gate',
+                                              'text_global_gate', 'text_soft_spatial', *RELIABLE_EXCHANGE_MODES,
+                                              *ANCHOR_EXCHANGE_MODES):
+            raise ValueError('Unsupported visual_exchange mode')
+        if self.visual_exchange_mode != 'lavs':
+            if (args.modality != 'rgbt' or self.is_siglip2 or str(args.model) != 'ViT-B/16'
+                    or args.imsize != 224 or self.fusion_method != 'IAFv3'
+                    or len(self.extract_vision_layer) != 4):
+                raise ValueError('Experimental exchange requires CLIP ViT-B/16, RGBT, IAFv3 and 224 input')
+            if getattr(args, 'clip_structure_new_only', False):
+                raise ValueError('Local exchange needs joint training of the existing projections')
+            # Preserve inherited initialization and the sampler/dropout RNG.
+            with torch.random.fork_rng(devices=[]):
+                if self.visual_exchange_mode in ('local', 'text_local'):
+                    self.local_modal_exchange = LocalModalExchange(
+                        radii=getattr(args, 'exchange_radii', (1, 1, 2, 3)),
+                        hidden_dim=getattr(args, 'exchange_gate_dim', 128))
+                elif self.visual_exchange_mode in ANCHOR_EXCHANGE_MODES:
+                    self.region_anchor_exchange = RegionAnchorExchange(
+                        anchor_count=getattr(args, 'anchor_count', 16),
+                        hidden_dim=getattr(args, 'anchor_dim', 128))
+                elif self.visual_exchange_mode in RELIABLE_EXCHANGE_MODES:
+                    self.reliable_modal_exchange = ReliableModalExchange(
+                        hidden_dim=getattr(args, 'exchange_gate_dim', 128),
+                        scales=getattr(args, 'exchange_spatial_scales', (1., 2., 3.)),
+                        bias_bound=getattr(args, 'exchange_bias_bound', 2.))
+                else:
+                    self.soft_modal_exchange = SoftSpatialModalExchange(
+                        hidden_dim=getattr(args, 'exchange_gate_dim', 128),
+                        scales=getattr(args, 'exchange_spatial_scales', (1., 2., 3.)),
+                        bias_bound=getattr(args, 'exchange_bias_bound', 2.))
+        self._exchange_new_training = False
+        self._exchange_projection_training = False
+        self._configure_exchange_tuning()
+
+    def _configure_exchange_tuning(self):
+        args = getattr(self, 'args', None)
+        new_only = bool(getattr(args, 'exchange_train_new_only', False))
+        projections = bool(getattr(args, 'exchange_projection_tuning', False))
+        if not (new_only or projections):
+            return
+        if new_only and getattr(args, 'visual_exchange', 'lavs') not in (*RELIABLE_EXCHANGE_MODES, *ANCHOR_EXCHANGE_MODES):
+            raise ValueError('Exchange-only tuning requires a reliability or anchor exchange mode')
+        if projections and getattr(args, 'visual_exchange', 'lavs') not in ('lavs', *RELIABLE_EXCHANGE_MODES, *ANCHOR_EXCHANGE_MODES):
+            raise ValueError('Projection tuning requires C1 or a reliability exchange mode')
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_((new_only and name.startswith(('reliable_modal_exchange.', 'region_anchor_exchange.')))
+                or (projections and name.startswith(('cross_fusion_layers_vt.', 'cross_fusion_layers_tv.'))))
+        if hasattr(self, 'clip'):
+            self._clip_control_trainability = {name: False for name, _ in self.clip.named_parameters()}
+
+    def _exchange_visual_levels(self, rgb, tir, text, padding, text_tokens=None, text_padding=None):
+        if self.visual_exchange_mode in ('lavs', *ANCHOR_EXCHANGE_MODES):
+            output_rgb, output_tir = [], []
+            for i, (r, t) in enumerate(zip(rgb, tir)):
+                into_rgb, _ = self.cross_fusion_layers_vt[i](
+                    r, t, attention_mask=None, causal_attention_mask=None, output_attentions=True)
+                into_tir, _ = self.cross_fusion_layers_tv[i](
+                    t, r, attention_mask=None, causal_attention_mask=None, output_attentions=True)
+                output_rgb.append(r + into_rgb)
+                output_tir.append(t + into_tir)
+            if self.visual_exchange_mode in ANCHOR_EXCHANGE_MODES:
+                if text_tokens is None or text_padding is None:
+                    raise ValueError('Anchor exchange requires full text tokens and padding')
+                return self.region_anchor_exchange(rgb, tir, output_rgb, output_tir,
+                    text_tokens, text_padding, padding, mode=self.visual_exchange_mode)
+            return output_rgb, output_tir
+        if self.visual_exchange_mode in RELIABLE_EXCHANGE_MODES:
+            output_rgb, output_tir, auxiliary = self.reliable_modal_exchange(
+                rgb, tir, self.cross_fusion_layers_vt, self.cross_fusion_layers_tv,
+                text, padding, mode=self.visual_exchange_mode,
+                corruption_targets=getattr(self, '_exchange_corruption_targets', None))
+            if self._exchange_new_training or self.training:
+                self._tsar_aux.update(auxiliary)
+            return output_rgb, output_tir
+        if self.visual_exchange_mode in ('global_gate', 'text_global_gate', 'text_soft_spatial'):
+            return self.soft_modal_exchange(
+                rgb, tir, self.cross_fusion_layers_vt, self.cross_fusion_layers_tv,
+                text, padding, use_text=self.visual_exchange_mode != 'global_gate',
+                use_spatial=self.visual_exchange_mode == 'text_soft_spatial')
+        return self.local_modal_exchange(
+            rgb, tir, self.cross_fusion_layers_vt, self.cross_fusion_layers_tv,
+            text, padding, use_text=self.visual_exchange_mode == 'text_local')
+
+    def _configure_a5_frontend_tuning(self):
+        if not getattr(self.args, 'infmae_frontend_only', False):
+            return
+        if self.fusion_method != 'InfMAEA5BridgeFTF2' or not self.enable_infmae_alignment:
+            raise ValueError('A5 frontend tuning requires the existing A5-F2 alignment architecture')
+        prefixes = ('infmae_direct_adapter.', 'infmae_direct_cls_projection.',
+                    'infmae_tir_text_projector.', 'infmae_tir_rgb_projector.')
+        for name, parameter in self.named_parameters():
+            thermal_lora = (name.startswith('infmae_direct_encoder.')
+                            and ('.lora_A.' in name or '.lora_B.' in name))
+            parameter.requires_grad_(name.startswith(prefixes) or thermal_lora)
+        self._a5_frontend_tuning_configured = True
+
+    def train(self, mode=True):
+        super().train(mode)
+        args = getattr(self, 'args', None)
+        self._exchange_new_training = bool(mode and getattr(args, 'exchange_train_new_only', False))
+        self._exchange_projection_training = bool(mode and getattr(args, 'exchange_projection_tuning', False))
+        if self._exchange_new_training or self._exchange_projection_training:
+            super().train(False)
+            if self._exchange_new_training:
+                if hasattr(self, 'region_anchor_exchange'):
+                    self.region_anchor_exchange.train(True)
+                else:
+                    self.reliable_modal_exchange.train(True)
+        self._clip_structure_training = bool(mode and getattr(args, 'clip_structure_new_only', False))
+        if self._clip_structure_training:
+            super().train(False)
+            for name in ('tir_detail', 'tir_injector', 'tir_region_head', 'boundary_refiner'):
+                if hasattr(self, name):
+                    getattr(self, name).train(True)
+        self._infmae_frontend_training = bool(mode and getattr(args, 'infmae_frontend_only', False))
+        if self._infmae_frontend_training:
+            # Eval keeps the fixed RGB/LAVS/IAFv3/VL/head dropout deterministic.
+            # Gradients through these fixed modules still reach the frontend.
+            super().train(False)
+            for name in ('infmae_direct_adapter', 'infmae_direct_cls_projection',
+                         'infmae_tir_text_projector', 'infmae_tir_rgb_projector'):
+                getattr(self, name).train()
+            for name, module in self.infmae_direct_encoder.named_modules():
+                if name.endswith(('lora_A', 'lora_B')):
+                    module.train()
+        return self
 
     def _configure_infmae_strict_frontend_tuning(self):
         """Freeze the original grounding trunk for the strict A7 PEFT route.
@@ -1518,6 +1722,17 @@ class MMVGFusion(nn.Module):
                 "Enabled TCRC: zero-init expression-aware local IAFv3 "
                 "reliability calibration after LAVS"
             )
+        self.modality_reliability_perturbation = None
+        if self.enable_infmae_modality_reliability_perturbation:
+            self.modality_reliability_perturbation = ModalityReliabilityPerturbation(
+                frontend_dim=self.backbone_visual_dim,
+                bottleneck_dim=max(self.backbone_visual_dim // 8, 1),
+                max_reliability_offset=0.5,
+            )
+            print(
+                "Enabled MRP: zero-init sample-level RGB/TIR reliability "
+                "perturbation from pre-LAVS features"
+            )
 
         if not self.enable_gqr:
             return
@@ -1617,14 +1832,17 @@ class MMVGFusion(nn.Module):
             if self.enable_infmae_hierarchical_adapter
             else InfMAEDirectThermalAdapter
         )
-        self.infmae_direct_adapter = adapter_class(
-            f2_dim=self.infmae_direct_encoder.f2_dim,
-            f3_dim=self.infmae_direct_encoder.f3_dim,
-            token_dim=self.backbone_visual_dim,
-            num_feature_levels=len(self.extract_vision_layer),
-            bottleneck_dim=max(self.backbone_visual_dim // 4, 1),
-            f2_scale_init=0.10,
-        )
+        adapter_kwargs = {
+            "f2_dim": self.infmae_direct_encoder.f2_dim,
+            "f3_dim": self.infmae_direct_encoder.f3_dim,
+            "token_dim": self.backbone_visual_dim,
+            "num_feature_levels": len(self.extract_vision_layer),
+            "bottleneck_dim": max(self.backbone_visual_dim // 4, 1),
+            "f2_scale_init": 0.10,
+        }
+        if self.enable_infmae_f2_peak:
+            adapter_kwargs["preserve_f2_peaks"] = True
+        self.infmae_direct_adapter = adapter_class(**adapter_kwargs)
         self.infmae_direct_cls_projection = nn.Linear(
             self.backbone_visual_dim,
             self.hidden_dim,
@@ -1864,10 +2082,17 @@ class MMVGFusion(nn.Module):
         "infmae_tir_text_projector.",
         "infmae_tir_rgb_projector.",
         "text_conditioned_reliability_calibrator.",
+        "modality_reliability_perturbation.",
     )
     _INFMAE_DIRECT_OMIT_FROM_CHECKPOINT_PREFIXES = (
         "infmae_direct_encoder.",
         "infmae_direct_input_normalizer.",
+    )
+    # Transformers versions differ on whether CLIP's deterministic position
+    # index is serialized as a persistent buffer.  It is regenerated from the
+    # model configuration, so older checkpoints may safely omit it.
+    _CLIP_DERIVED_BUFFER_MISSING_PREFIXES = (
+        "clip.base_model.model.text_model.embeddings.position_ids",
     )
 
     def state_dict(self, *args, **kwargs):
@@ -1901,6 +2126,11 @@ class MMVGFusion(nn.Module):
             incompatible = super().load_state_dict(state_dict, strict=False)
 
         missing_keys = list(incompatible.missing_keys)
+        missing_keys = [
+            key
+            for key in missing_keys
+            if not key.startswith(self._CLIP_DERIVED_BUFFER_MISSING_PREFIXES)
+        ]
         if getattr(self, "enable_infmae", False):
             missing_keys = [
                 key
@@ -1908,6 +2138,12 @@ class MMVGFusion(nn.Module):
                 if not key.startswith(self._INFMAE_MISSING_PREFIXES)
             ]
         unexpected_keys = list(incompatible.unexpected_keys)
+        if getattr(self, 'infmae_local_center', None) is not None and not any(
+            key.startswith("infmae_local_center.") for key in state_dict
+        ):
+            # Only a baseline checkpoint may omit the entire new zero-init
+            # head. Partially missing refiner checkpoints remain strict errors.
+            missing_keys = [key for key in missing_keys if not key.startswith("infmae_local_center.")]
         if getattr(self, "enable_infmae_direct", False):
             missing_keys = [
                 key
@@ -2014,7 +2250,10 @@ class MMVGFusion(nn.Module):
             "InfMAEA8EvidencePEFT": "both",
             "InfMAEA5BridgeFTTCRC": "both",
             "InfMAEA5BridgeFTF2": "both",
+            "InfMAEA5BridgeFTF2Peak": "both",
             "InfMAEA5BridgeFTF2PEFT": "both",
+            "InfMAEA5BridgeFTF2GQR": "both",
+            "InfMAEA5BridgeFTF2MRP": "both",
         }
         requested = str(getattr(args, "infmae_alignment_mode", "auto")).lower()
         allowed = {"auto", "none", "tir_text", "rgb_tir", "both"}
@@ -2041,8 +2280,10 @@ class MMVGFusion(nn.Module):
             "InfMAEA7HAdapterF3PEFT",
             "InfMAEA8EvidencePEFT",
             "InfMAEA5BridgeFTTCRC",
-            "InfMAEA5BridgeFTF2",
+            "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak",
             "InfMAEA5BridgeFTF2PEFT",
+            "InfMAEA5BridgeFTF2GQR",
+            "InfMAEA5BridgeFTF2MRP",
         } and requested != default:
             raise ValueError(
                 f"{method} requires --infmae_alignment_mode {default!r}, "
@@ -2068,7 +2309,7 @@ class MMVGFusion(nn.Module):
         # then partially re-freeze it again.  This branch changes no baseline
         # or GQR behavior and leaves the frozen InfMAE encoder untouched.
         layer_limit = 12 if (getattr(self, "enable_infmae_direct", False)
-                             or getattr(self.args, 'match_infmae_lora_schedule', False)) else stage_limits[stage]
+                             or getattr(getattr(self, 'args', None), 'match_infmae_lora_schedule', False)) else stage_limits[stage]
         for name, parameter in self.clip.named_parameters():
             is_lora_parameter = ".lora_A." in name or ".lora_B." in name
             parameter.requires_grad_(False)
@@ -2153,9 +2394,14 @@ class MMVGFusion(nn.Module):
             self._configure_infmae_tcrc_peft_tuning()
         if getattr(self, "_f2_peft_tuning_configured", False):
             self._configure_infmae_f2_peft_tuning()
-
+        if getattr(self, '_a5_frontend_tuning_configured', False):
+            self._configure_a5_frontend_tuning()
+        if getattr(args, 'clip_structure_new_only', False):
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(name.startswith(NEW_MODULE_PREFIXES))
         if getattr(args, 'match_infmae_lora_schedule', False):
             self._clip_control_trainability = {name: p.requires_grad for name, p in self.clip.named_parameters()}
+        self._configure_exchange_tuning()
 
         if self.open_lora and hasattr(self.clip, "print_trainable_parameters"):
             self.clip.print_trainable_parameters()
@@ -2247,7 +2493,7 @@ class MMVGFusion(nn.Module):
             self.lif_weight_net = LIFWeightNet()
         if self.fusion_method in (
             "IAF", "IAFv2.1", "IAFv3", "GQRv1", "GQRv1InfMAE",
-            "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTTCRC", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2PEFT", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
+            "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTTCRC", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak", "InfMAEA5BridgeFTF2PEFT", "InfMAEA5BridgeFTF2GQR", "InfMAEA5BridgeFTF2MRP", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
         ):
             self.iaf_gate = nn.Sequential(
                 nn.Linear(self.hidden_dim * 3, self.hidden_dim),
@@ -2259,7 +2505,7 @@ class MMVGFusion(nn.Module):
             self.iaf_gamma = nn.Parameter(torch.tensor(0.6))
         if self.fusion_method in (
             "IAFv2.1", "IAFv3", "GQRv1", "GQRv1InfMAE",
-            "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTTCRC", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2PEFT", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
+            "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTTCRC", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak", "InfMAEA5BridgeFTF2PEFT", "InfMAEA5BridgeFTF2GQR", "InfMAEA5BridgeFTF2MRP", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
         ):
             self.iafv2_token_gate = nn.Sequential(
                 nn.Linear(self.hidden_dim * 3, self.hidden_dim),
@@ -2277,7 +2523,7 @@ class MMVGFusion(nn.Module):
             self.iafv2_res = nn.Parameter(torch.tensor(0.15))
         if self.fusion_method in (
             "IAFv3", "GQRv1", "GQRv1InfMAE",
-            "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTTCRC", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2PEFT", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
+            "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTTCRC", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak", "InfMAEA5BridgeFTF2PEFT", "InfMAEA5BridgeFTF2GQR", "InfMAEA5BridgeFTF2MRP", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
         ):
             self.iafv3_token_gate = nn.Sequential(
                 nn.Linear(self.hidden_dim * 3, self.hidden_dim),
@@ -2513,6 +2759,21 @@ class MMVGFusion(nn.Module):
         self._tsar_aux.update(calibration_aux)
         return self._compose_iafv3_tokens(components, calibrated_weight)
 
+    def _fusion_mrp(self, rgb_tokens, ir_tokens, rgb_image, reliability_context):
+        """Apply a sample-level pre-LAVS reliability offset to IAFv3."""
+        if self.modality_reliability_perturbation is None:
+            raise RuntimeError("MRP fusion is missing its reliability module")
+        if reliability_context is None or len(reliability_context) != 2:
+            raise ValueError("MRP fusion requires pre-LAVS RGB/TIR features")
+        components = self._iafv3_components(rgb_tokens, ir_tokens, rgb_image)
+        calibrated_weight, calibration_aux = self.modality_reliability_perturbation(
+            reliability_context[0],
+            reliability_context[1],
+            components["w_rgb_base"],
+        )
+        self._tsar_aux.update(calibration_aux)
+        return self._compose_iafv3_tokens(components, calibrated_weight)
+
     def _fusion_gqrv1(self, rgb_tokens, ir_tokens, rgb_image, text_embed):
         """IAFv3 plus a zero-initialized, text-conditioned logit correction."""
         if text_embed is None:
@@ -2555,7 +2816,10 @@ class MMVGFusion(nn.Module):
         })
         return self._compose_iafv3_tokens(components, w_rgb_final)
 
-    def _fuse_visual_tokens(self, rgb_tokens, ir_tokens, rgb_image, text_embed=None):
+    def _fuse_visual_tokens(
+        self, rgb_tokens, ir_tokens, rgb_image, text_embed=None,
+        modality_reliability_context=None,
+    ):
         if self.fusion_method == "add":
             return self._fusion_add(rgb_tokens, ir_tokens, rgb_image)
         if self.fusion_method == "concat":
@@ -2572,11 +2836,19 @@ class MMVGFusion(nn.Module):
             return self._fusion_iafv2_1(rgb_tokens, ir_tokens, rgb_image)
         if self.fusion_method == "InfMAEA5BridgeFTTCRC":
             return self._fusion_tcrc(rgb_tokens, ir_tokens, rgb_image, text_embed)
+        if self.fusion_method == "InfMAEA5BridgeFTF2MRP":
+            return self._fusion_mrp(
+                rgb_tokens, ir_tokens, rgb_image, modality_reliability_context
+            )
         if self.fusion_method in (
-            "IAFv3", "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2PEFT", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
+            "IAFv3", "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak", "InfMAEA5BridgeFTF2PEFT", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
         ):
             return self._fusion_iafv3(rgb_tokens, ir_tokens, rgb_image)
-        if self.fusion_method in ("GQRv1", "GQRv1InfMAE"):
+        if self.fusion_method in (
+            "GQRv1",
+            "GQRv1InfMAE",
+            "InfMAEA5BridgeFTF2GQR",
+        ):
             return self._fusion_gqrv1(rgb_tokens, ir_tokens, rgb_image, text_embed)
         return self._fusion_concat(rgb_tokens, ir_tokens, rgb_image)
 
@@ -2746,17 +3018,31 @@ class MMVGFusion(nn.Module):
 
     def _format_model_output(self, main_out):
         """Keep validation on the legacy five-value MMVGFusion interface."""
-        if self.training and (
+        if (self.training or self._infmae_frontend_training or self._clip_structure_training
+                or getattr(self, '_exchange_new_training', False)) and (
             getattr(self, "enable_gqr", False)
             or getattr(self, "enable_infmae_alignment", False)
+            or getattr(self, 'enable_tir_detail', False) or getattr(self, 'enable_boundary_refiner', False)
+            or getattr(self, 'visual_exchange_mode', 'lavs') in RELIABLE_EXCHANGE_MODES
         ):
             return (*main_out, self._tsar_aux)
         return main_out
 
     def _select_grounding_clip_adapter(self, name):
         self.clip.set_adapter(name)
-        if getattr(self.args, 'match_infmae_lora_schedule', False):
-            # PEFT switches otherwise close the inactive RGB/TIR adapter before backward.
+        if (self.infmae_local_center is not None
+                or getattr(self.args, "infmae_bbox_head_only", False)
+                or getattr(self.args, "infmae_frontend_only", False)
+                or getattr(self.args, 'clip_structure_new_only', False)
+                or getattr(self.args, 'exchange_train_new_only', False)
+                or getattr(self.args, 'exchange_projection_tuning', False)):
+            # PEFT set_adapter reopens the active LoRA's requires_grad flag.
+            # Frozen-head screens must close it after every switch.
+            for parameter in self.clip.parameters():
+                parameter.requires_grad_(False)
+        elif getattr(self.args, 'match_infmae_lora_schedule', False):
+            # This control keeps the same full RGB LoRA schedule as A5-F2.
+            # PEFT switches otherwise close the inactive IR adapter before backward.
             for parameter_name, parameter in self.clip.named_parameters():
                 parameter.requires_grad_(self._clip_control_trainability[parameter_name])
 
@@ -2765,9 +3051,20 @@ class MMVGFusion(nn.Module):
         # Clearing them here prevents stale tensors from a prior batch from
         # ever being returned after a feature toggle or an exception.
         self._tsar_aux = {}
+        self._local_center_diagnostics = {}
+        self._exchange_corruption_targets = None
+        if (getattr(self, '_exchange_new_training', False)
+                and self.visual_exchange_mode in RELIABLE_EXCHANGE_MODES):
+            if self.args.dataset != 'rgbtvg_flir' or getattr(self.args, 'image_norm', 'dataset') != 'dataset':
+                raise ValueError('Exchange corruption currently supports dataset-normalized RefFLIR only')
+            perturbed, self._exchange_corruption_targets = corrupt_modalities(
+                img_data.tensors, img_data.mask,
+                probability=getattr(self.args, 'exchange_corruption_probability', .35))
+            img_data = NestedTensor(perturbed, img_data.mask)
         if self.open_lora:
             self._select_grounding_clip_adapter("lora_rgb")
         if self.args.modality =="rgbt":
+            tir_detail_input = img_data.tensors[:, 3:4]
             image_tensors_ir=img_data.tensors[:,3:,:,:].repeat(1,3,1,1)
             img_data_ir_mask=img_data.mask
             img_data_ir = NestedTensor(image_tensors_ir,img_data_ir_mask)
@@ -2850,10 +3147,12 @@ class MMVGFusion(nn.Module):
         else:
             img_cls_embed = self.clip.visual_projection(clip_image_features["pooler_output"])  # torch.Size([64, 512])
 
-        capture_infmae_alignment = self.training and self.enable_infmae_alignment
+        capture_infmae_alignment = (self.training or self._infmae_frontend_training) and self.enable_infmae_alignment
         rgb_target_patch_tokens = None
         tir_target_patch_tokens = None
         tir_alignment_features = None
+        tir_reliability_features = None
+        modality_reliability_context = None
         if capture_infmae_alignment and target_boxes is None:
             raise ValueError(
                 "FusionMethod with InfMAE A3/A4/A5 alignment requires target_boxes in training mode"
@@ -2879,6 +3178,8 @@ class MMVGFusion(nn.Module):
                         ml_image_features,
                         ml_image_features_ir,
                     )
+                if self.enable_infmae_modality_reliability_perturbation:
+                    tir_reliability_features = tuple(ml_image_features_ir)
                 if capture_infmae_alignment:
                     # Preserve the unmodified adapter output for the A3/A5
                     # target-region loss, then optionally block the ordinary
@@ -2914,6 +3215,27 @@ class MMVGFusion(nn.Module):
                 else:
                     img_cls_embed_ir = self.clip.visual_projection(clip_image_features_ir["pooler_output"])  # torch.Size([64, 512])
 
+            detail_features, detail_masks = (), ()
+            if self.enable_tir_detail:
+                if getattr(self.args, 'clip_structure_blur_detail', False):
+                    # Validation-only intervention; preserve the original CLIP input.
+                    tir_detail_input = F.avg_pool2d(tir_detail_input, 9, stride=1, padding=4)
+                detail_features, detail_masks = self.tir_detail(tir_detail_input, img_data.mask)
+                ml_image_features_ir = self.tir_injector(
+                    ml_image_features_ir, text_eos_embed, detail_features, detail_masks)
+                if self.training or self._clip_structure_training:
+                    self._tsar_aux['tir_region_logits'] = self.tir_region_head(detail_features[0], text_eos_embed)
+                    self._tsar_aux['tir_region_padding'] = detail_masks[0]
+                    self._tsar_aux['tir_region_valid_fraction'] = F.adaptive_avg_pool2d(
+                        (~img_data.mask.bool())[:, None].float(), detail_features[0].shape[-2:])[:, 0]
+            if self.enable_boundary_refiner:
+                # Save BEFORE bidirectional external LAVS changes either stream.
+                def independent_memory(levels):
+                    tokens = self.visu_proj(self.ml_visual_projection(torch.cat(levels, dim=2)).float())
+                    return tokens[:, 1:].transpose(1, 2).reshape(batch_size, 512, 14, 14)
+                independent_rgb = independent_memory(ml_image_features)
+                independent_tir = independent_memory(ml_image_features_ir)
+                independent_mask = resize_padding(img_data.mask, (14, 14))
             if capture_infmae_alignment:
                 # Average the four pre-LAVS feature levels.  This supervises
                 # every direct-InfMAE stage adapter while preserving the
@@ -2930,12 +3252,21 @@ class MMVGFusion(nn.Module):
                     )],
                     dim=0,
                 ).mean(dim=0)
-            for i in range(len(self.extract_vision_layer)):
-
-                ml_image_features_fusion_vt,_ = self.cross_fusion_layers_vt[i](ml_image_features[i], ml_image_features_ir[i],  attention_mask=None,causal_attention_mask=None,output_attentions=True)
-                ml_image_features_fusion_tv,_ = self.cross_fusion_layers_tv[i](ml_image_features_ir[i], ml_image_features[i],  attention_mask=None,causal_attention_mask=None,output_attentions=True)
-                ml_image_features[i] = ml_image_features[i]+ml_image_features_fusion_vt
-                ml_image_features_ir[i] =  ml_image_features_ir[i] +ml_image_features_fusion_tv
+            if self.enable_infmae_modality_reliability_perturbation:
+                if tir_reliability_features is None:
+                    raise RuntimeError("MRP requires direct InfMAE pre-LAVS TIR features")
+                rgb_reliability_features = torch.stack(
+                    [features[:, 1:, :] for features in ml_image_features], dim=0
+                ).mean(dim=0)
+                tir_reliability_tokens = torch.stack(
+                    [features[:, 1:, :] for features in tir_reliability_features], dim=0
+                ).mean(dim=0)
+                modality_reliability_context = (
+                    rgb_reliability_features, tir_reliability_tokens
+                )
+            ml_image_features, ml_image_features_ir = self._exchange_visual_levels(
+                ml_image_features, ml_image_features_ir, text_eos_embed, visu_mask,
+                text_tokens=text_features, text_padding=text_mask)
             # for i,cross_fusion in enumerate(.cross_fusion_layers):
             #     #TODO
         ml_image_features = torch.cat(ml_image_features, dim=2)
@@ -2980,6 +3311,7 @@ class MMVGFusion(nn.Module):
                 visu_src_ir,
                 image_tensors,
                 text_embed=fusion_text_embed,
+                modality_reliability_context=modality_reliability_context,
             )
             if self.fusion_method == "concat":
                 vl_src = torch.cat([reg_src, fused_visu_src, text_src], dim=0)
@@ -2997,6 +3329,21 @@ class MMVGFusion(nn.Module):
         vg_hs = self.vl_transformer(vl_src, vl_mask, vl_pos)  # (1+L+N)xBxC
         box_hs = vg_hs[0]
         pred_box = self.bbox_embed(box_hs).sigmoid()
+        if self.enable_boundary_refiner:
+            coarse_box = pred_box
+            pred_box, boundary_aux = self.boundary_refiner(
+                box_hs, text_eos_embed, text_src.permute(1, 0, 2), text_mask,
+                coarse_box, (independent_rgb, independent_tir),
+                (independent_mask, independent_mask), detail_features, detail_masks,
+                disable_independent_memory=getattr(self.args, 'clip_structure_disable_memory', False),
+                image_padding_mask=img_data.mask)
+            boundary_aux['boundary_b0'] = coarse_box
+            if self.training or self._clip_structure_training:
+                self._tsar_aux.update(boundary_aux)
+        if self.infmae_local_center is not None:
+            pred_box, self._local_center_diagnostics = self.infmae_local_center(
+                infmae_f2, box_hs, pred_box
+            )
 
         # normalized features
         img_cls_embed = img_cls_embed / img_cls_embed.norm(p=2, dim=-1, keepdim=True)
