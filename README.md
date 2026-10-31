@@ -1,5 +1,7 @@
 Current source release: **[v3.0](docs/RELEASE_v3.0.md)** — CLIP RGB/T optimization experiments, single-model late adaptation with EMA, evaluation and checkpoint utilities. See the release notes for resource requirements and measured results.
 
+实验运行说明：**[v3.0 实验入口与运行说明](docs/Run_CLIP_Experiments_v3.0.md)**，包含主要入口、资源配置、训练、续训、评价及结果文件说明。
+
 <div align="center">
 
 <h1>RGBT-GroundBench</h1>
