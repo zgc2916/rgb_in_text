@@ -80,8 +80,9 @@ def get_args_parser():
     parser.add_argument('--visual_exchange', default='lavs',
                         choices=('lavs', 'local', 'text_local', 'global_gate', 'text_global_gate', 'text_soft_spatial',
                                  'direction_gate', 'reliability_gate', 'reliability_spatial',
-                                 'anchor_visual', 'anchor_text_shared', 'anchor_text_separate'),
-                        help='External RGB/TIR exchange; keep internal language bridges unchanged')
+                                 'anchor_visual', 'anchor_text_shared', 'anchor_text_separate', 'deformable_lavs',
+                                 'differential_lavs'),
+                        help='RGB/TIR exchange; registered replacement modes require replace_lavs')
     parser.add_argument('--exchange_radii', nargs=4, type=int, default=[1, 1, 2, 3])
     parser.add_argument('--exchange_gate_dim', type=int, default=128)
     parser.add_argument('--anchor_count', type=int, default=16)
@@ -97,6 +98,12 @@ def get_args_parser():
     parser.add_argument('--exchange_preserve_weight', type=float, default=.005)
     parser.add_argument('--open_lora', default=True, type=str2bool)
     parser.add_argument('--open_text_guided_fusion', default=True, type=str2bool)
+    parser.add_argument('--replace_lavs', action='store_true',
+                        help='Replace both paper-LAVS components using a registered replacement exchange')
+    parser.add_argument('--differential_enabled', action='store_true',
+                        help='Enable text-conditioned reference-attention subtraction in differential_lavs')
+    parser.add_argument('--replacement_fixed_offsets', action='store_true')
+    parser.add_argument('--replacement_dim', type=int, default=128)
     # Language-Aware Visual Synergy 模式：lavs / iwm / cmx / avg
     # - lavs: 原始 LAVS
     # - iwm: IWM 融合

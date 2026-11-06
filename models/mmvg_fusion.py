@@ -555,7 +555,16 @@ class CLIPEncoderLayer_with_Crossmodal_Text_Guided_Fusion(nn.Module):
         """ Multi-layer Adaptive Cross-modal Text_Guided_Fusion """
         # self.enable_adaptive_weights = args.enable_adaptive_weights
         if i in adapt_layer:
-            if self.args.modality == 'rgb':
+            if getattr(args, 'replace_lavs', False):
+                if getattr(args, 'visual_exchange', '') == 'differential_lavs':
+                    from .differential_lavs import DifferentialLanguageBlock
+                    self.language_replacement = DifferentialLanguageBlock(
+                        self.embed_dim, config.num_attention_heads, config.intermediate_size,
+                        enabled=getattr(args, 'differential_enabled', True), eps=config.layer_norm_eps)
+                else:
+                    from .lavs_replacement import WordConditioningBlock
+                    self.word_conditioner = WordConditioningBlock(self.embed_dim, getattr(args, 'replacement_dim', 128))
+            elif self.args.modality == 'rgb':
                 self.cross_norm_sv = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)  # eps=1e-05
                 self.cross_attn_sv = CLIP_Cross_Attention_VS(config)
                 self.cross_mlp_sv = CLIPMLP(config)
@@ -586,6 +595,7 @@ class CLIPEncoderLayer_with_Crossmodal_Text_Guided_Fusion(nn.Module):
         attention_mask: torch.Tensor,
         causal_attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = False,
+        language_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor]:
         """
         Args:
@@ -609,36 +619,40 @@ class CLIPEncoderLayer_with_Crossmodal_Text_Guided_Fusion(nn.Module):
         hidden_states = residual + hidden_states
         """ Multi-layer Adaptive Cross-modal Text_Guided_Fusion """
         if layer in adapt_layer:
-            text_guided_fusion = True
-            if text_guided_fusion == True:
+            if getattr(self.args, 'replace_lavs', False):
+                words = text_states[-1].to(hidden_states.dtype)
+                conditioner = self.language_replacement if hasattr(self, 'language_replacement') else self.word_conditioner
+                hidden_states = conditioner(hidden_states, words, language_padding_mask, cur_modality)
+            else:
+                text_guided_fusion = True
+                if text_guided_fusion == True:
 
-                if cur_modality=='ir':
-                    residual = hidden_states
-                    hidden_states = self.cross_norm_st(hidden_states)
-                    text_states = text_states[-1].to(hidden_states.dtype).permute(1, 0, 2)
-                    
-                    hidden_states, attn_weights = self.cross_attn_st(
-                        hidden_states=hidden_states,
-                        text_states=text_states,
-                        attention_mask=attention_mask,
-                        causal_attention_mask=causal_attention_mask,
-                        output_attentions=output_attentions,
-                    )
-                    hidden_states = self.cross_mlp_st(hidden_states)
-                else:
-                    residual = hidden_states
-                    hidden_states = self.cross_norm_sv(hidden_states)
-                    text_states = text_states[-1].to(hidden_states.dtype).permute(1, 0, 2)
-                    hidden_states, attn_weights = self.cross_attn_sv(
-                        hidden_states=hidden_states,
-                        text_states=text_states,
-                        attention_mask=attention_mask,
-                        causal_attention_mask=causal_attention_mask,
-                        output_attentions=output_attentions,
-                    )
-                    hidden_states = self.cross_mlp_sv(hidden_states)
-            hidden_states = residual + hidden_states
+                    if cur_modality=='ir':
+                        residual = hidden_states
+                        hidden_states = self.cross_norm_st(hidden_states)
+                        text_states = text_states[-1].to(hidden_states.dtype).permute(1, 0, 2)
 
+                        hidden_states, attn_weights = self.cross_attn_st(
+                            hidden_states=hidden_states,
+                            text_states=text_states,
+                            attention_mask=attention_mask,
+                            causal_attention_mask=causal_attention_mask,
+                            output_attentions=output_attentions,
+                        )
+                        hidden_states = self.cross_mlp_st(hidden_states)
+                    else:
+                        residual = hidden_states
+                        hidden_states = self.cross_norm_sv(hidden_states)
+                        text_states = text_states[-1].to(hidden_states.dtype).permute(1, 0, 2)
+                        hidden_states, attn_weights = self.cross_attn_sv(
+                            hidden_states=hidden_states,
+                            text_states=text_states,
+                            attention_mask=attention_mask,
+                            causal_attention_mask=causal_attention_mask,
+                            output_attentions=output_attentions,
+                        )
+                        hidden_states = self.cross_mlp_sv(hidden_states)
+                hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -681,6 +695,7 @@ class CLIPEncoder_with_Crossmodal_Text_Guided_Fusion(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        language_padding_mask: Optional[torch.Tensor] = None,
     ):
         r"""
         Args:
@@ -732,6 +747,7 @@ class CLIPEncoder_with_Crossmodal_Text_Guided_Fusion(nn.Module):
                     adapt_layer = adapt_layer,
                     text_states = text_states,
                     cur_modality = cur_modality,
+                    language_padding_mask=language_padding_mask,
                     attention_mask=attention_mask,
                     causal_attention_mask=causal_attention_mask,
                     output_attentions=output_attentions,
@@ -745,6 +761,7 @@ class CLIPEncoder_with_Crossmodal_Text_Guided_Fusion(nn.Module):
                     adapt_layer = adapt_layer,
                     text_states = text_states,
                     cur_modality=cur_modality,
+                    language_padding_mask=language_padding_mask,
                     attention_mask=attention_mask,
                     causal_attention_mask=causal_attention_mask,
                     output_attentions=output_attentions,
@@ -786,6 +803,7 @@ class CLIP_Vision_Model_with_Crossmodal_Text_Guided_Fusion(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        language_padding_mask: Optional[torch.Tensor] = None,
     ):
         r"""
         Returns:
@@ -808,6 +826,7 @@ class CLIP_Vision_Model_with_Crossmodal_Text_Guided_Fusion(nn.Module):
             adapt_layer=adapt_layer,
             text_states=text_states,
             cur_modality=cur_modality,
+            language_padding_mask=language_padding_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1078,7 +1097,7 @@ class MMVGFusion(nn.Module):
             )
         self.cross_fusion_layers_vt = nn.ModuleList()
         self.cross_fusion_layers_tv = nn.ModuleList()
-        if self.args.modality =="rgbt":
+        if self.args.modality =="rgbt" and not getattr(args, 'replace_lavs', False):
             for _ in self.extract_vision_layer:
                 cross_attn_vt = CLIP_Cross_Attention(self.clip.vision_model.encoder.config)
                 cross_attn_tv = CLIP_Cross_Attention(self.clip.vision_model.encoder.config)
@@ -1204,6 +1223,10 @@ class MMVGFusion(nn.Module):
 
         self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
         self.reg_pos_embed = nn.Embedding(1, self.hidden_dim)
+        self.dense_reliability = None
+        if getattr(args, 'dense_text_gate', False):
+            from .dense_grid import DenseTextReliability
+            self.dense_reliability = DenseTextReliability()
         self.condition_text_pos_embed = nn.Embedding(self.num_text_token, clip_visu_hidden_dim)
         self.ml_visual_projection = nn.Linear(
             len(self.extract_vision_layer) * self.backbone_visual_dim,
@@ -1281,8 +1304,10 @@ class MMVGFusion(nn.Module):
         self.visual_exchange_mode = getattr(args, 'visual_exchange', 'lavs')
         if self.visual_exchange_mode not in ('lavs', 'local', 'text_local', 'global_gate',
                                               'text_global_gate', 'text_soft_spatial', *RELIABLE_EXCHANGE_MODES,
-                                              *ANCHOR_EXCHANGE_MODES):
+                                              *ANCHOR_EXCHANGE_MODES, 'deformable_lavs', 'differential_lavs'):
             raise ValueError('Unsupported visual_exchange mode')
+        if getattr(args, 'replace_lavs', False) != (self.visual_exchange_mode in ('deformable_lavs', 'differential_lavs')):
+            raise ValueError('Full LAVS replacement requires a registered replacement exchange and replace_lavs together')
         if self.visual_exchange_mode != 'lavs':
             if (args.modality != 'rgbt' or self.is_siglip2 or str(args.model) != 'ViT-B/16'
                     or args.imsize != 224 or self.fusion_method != 'IAFv3'
@@ -1292,7 +1317,16 @@ class MMVGFusion(nn.Module):
                 raise ValueError('Local exchange needs joint training of the existing projections')
             # Preserve inherited initialization and the sampler/dropout RNG.
             with torch.random.fork_rng(devices=[]):
-                if self.visual_exchange_mode in ('local', 'text_local'):
+                if self.visual_exchange_mode == 'differential_lavs':
+                    from .differential_lavs import DifferentialVisualExchange
+                    self.differential_exchange = DifferentialVisualExchange(
+                        enabled=getattr(args, 'differential_enabled', True))
+                elif self.visual_exchange_mode == 'deformable_lavs':
+                    from .lavs_replacement import CrossLevelDeformableExchange
+                    self.replacement_exchange = CrossLevelDeformableExchange(
+                        hidden=getattr(args, 'replacement_dim', 128),
+                        learn_offsets=not getattr(args, 'replacement_fixed_offsets', False))
+                elif self.visual_exchange_mode in ('local', 'text_local'):
                     self.local_modal_exchange = LocalModalExchange(
                         radii=getattr(args, 'exchange_radii', (1, 1, 2, 3)),
                         hidden_dim=getattr(args, 'exchange_gate_dim', 128))
@@ -1331,6 +1365,10 @@ class MMVGFusion(nn.Module):
             self._clip_control_trainability = {name: False for name, _ in self.clip.named_parameters()}
 
     def _exchange_visual_levels(self, rgb, tir, text, padding, text_tokens=None, text_padding=None):
+        if self.visual_exchange_mode == 'differential_lavs':
+            return self.differential_exchange(rgb, tir, text_tokens, text_padding, padding)
+        if self.visual_exchange_mode == 'deformable_lavs':
+            return self.replacement_exchange(rgb, tir, text_tokens, text_padding, padding)
         if self.visual_exchange_mode in ('lavs', *ANCHOR_EXCHANGE_MODES):
             output_rgb, output_tir = [], []
             for i, (r, t) in enumerate(zip(rgb, tir)):
@@ -2818,7 +2856,7 @@ class MMVGFusion(nn.Module):
 
     def _fuse_visual_tokens(
         self, rgb_tokens, ir_tokens, rgb_image, text_embed=None,
-        modality_reliability_context=None,
+        modality_reliability_context=None, spatial_padding=None,
     ):
         if self.fusion_method == "add":
             return self._fusion_add(rgb_tokens, ir_tokens, rgb_image)
@@ -2843,7 +2881,10 @@ class MMVGFusion(nn.Module):
         if self.fusion_method in (
             "IAFv3", "InfMAEDirectV2", "InfMAEA3", "InfMAEA4", "InfMAEA5", "InfMAEA5Bridge", "InfMAEA5BridgeFT", "InfMAEA5BridgeFTF2", "InfMAEA5BridgeFTF2Peak", "InfMAEA5BridgeFTF2PEFT", "InfMAEA6SpatialFT", "InfMAEA6MassFT", "InfMAEA7HAdapter", "InfMAEA7HAdapterFT", "InfMAEA7HAdapterFTStrict", "InfMAEA7HAdapterF3PEFT", "InfMAEA8EvidencePEFT",
         ):
-            return self._fusion_iafv3(rgb_tokens, ir_tokens, rgb_image)
+            fused = self._fusion_iafv3(rgb_tokens, ir_tokens, rgb_image)
+            if getattr(self, 'dense_reliability', None) is not None:
+                fused = self.dense_reliability(fused, rgb_tokens, ir_tokens, text_embed, spatial_padding)
+            return fused
         if self.fusion_method in (
             "GQRv1",
             "GQRv1InfMAE",
@@ -3102,7 +3143,7 @@ class MMVGFusion(nn.Module):
             fusion_text_embed = F.normalize(
                 self.gqr_text_proj(text_eos_embed.float()), dim=-1
             )
-        elif self.enable_infmae_text_reliability_calibration:
+        elif self.enable_infmae_text_reliability_calibration or getattr(self.args, 'dense_text_gate', False):
             # This is a fixed CLIP semantic query.  The TCRC itself learns
             # only how to calibrate an existing IAFv3 decision, not a new
             # text embedding space or an RGB/TIR encoder.
@@ -3137,6 +3178,8 @@ class MMVGFusion(nn.Module):
         }
         if self.is_siglip2:
             vision_kwargs["text_padding_mask"] = text_mask
+        elif getattr(self.args, 'replace_lavs', False):
+            vision_kwargs["language_padding_mask"] = text_mask
         clip_image_features = self.clip.vision_model(**vision_kwargs)
         # attention_map = clip_image_features["attentions"]  # tuple, used for draw the attention map
 
@@ -3312,6 +3355,7 @@ class MMVGFusion(nn.Module):
                 image_tensors,
                 text_embed=fusion_text_embed,
                 modality_reliability_context=modality_reliability_context,
+                spatial_padding=visu_mask,
             )
             if self.fusion_method == "concat":
                 vl_src = torch.cat([reg_src, fused_visu_src, text_src], dim=0)
@@ -3324,7 +3368,13 @@ class MMVGFusion(nn.Module):
             vl_src = torch.cat([reg_src, visu_src, text_src], dim=0)
             vl_mask = torch.cat([reg_mask, cls_mask, visu_mask, text_mask], dim=1)
 
-        vl_pos = self.vl_pos_embed.weight[:vl_src.size(0)].unsqueeze(1).repeat(1, batch_size, 1)
+        if getattr(self.args, 'dense_grid_enabled', False):
+            from .dense_grid import grounding_positions
+            position_weight = grounding_positions(self.vl_pos_embed.weight,
+                                                  int(math.sqrt(self.num_visu_token)), self.num_text_token)
+        else:
+            position_weight = self.vl_pos_embed.weight[:vl_src.size(0)]
+        vl_pos = position_weight.unsqueeze(1).repeat(1, batch_size, 1)
 
         vg_hs = self.vl_transformer(vl_src, vl_mask, vl_pos)  # (1+L+N)xBxC
         box_hs = vg_hs[0]

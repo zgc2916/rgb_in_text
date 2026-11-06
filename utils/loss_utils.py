@@ -581,6 +581,29 @@ def trans_vg_loss(
     if coef1 < 0 or coef2 < 0:
         raise ValueError('box_l1_weight and box_giou_weight must be non-negative')
     losses['loss_bbox'] = (loss_bbox.sum() / num_boxes) * coef1
+    if getattr(args, 'center_evidence_enabled', False):
+        import math
+        from models.center_evidence import center_heatmap_loss
+        if not isinstance(aux, dict) or 'center_evidence' not in aux:
+            raise ValueError('Center evidence training requires its auxiliary output')
+        weight = float(getattr(args, 'center_evidence_loss_weight', .1))
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError('center_evidence_loss_weight must be finite and non-negative')
+        center_loss, center_stats = center_heatmap_loss(aux['center_evidence'], batch_target, return_stats=True)
+        losses['loss_center_heatmap'] = weight * center_loss
+        losses['center_eligible_fraction'] = center_stats['eligible_fraction']
+    tcr_mode = getattr(args, 'tcr_mode', 'off')
+    if tcr_mode not in ('off', 'loss_only', 'bias'):
+        raise ValueError(f'Unsupported TCR-LAVS mode: {tcr_mode}')
+    if tcr_mode != 'off':
+        import math
+        from models.tcr_lavs import target_alignment_loss
+        if not isinstance(aux, dict) or 'tcr_target' not in aux:
+            raise ValueError('TCR-LAVS target supervision requires its auxiliary output')
+        weight = float(getattr(args, 'tcr_loss_weight', .05))
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError('tcr_loss_weight must be finite and non-negative')
+        losses['loss_tcr_target'] = weight * target_alignment_loss(aux['tcr_target'], batch_target)
     if getattr(args, 'relative_geometry_enabled', False):
         from .relative_geometry_losses import relative_geometry_losses
         losses.update(relative_geometry_losses(args, batch_pred, batch_target))

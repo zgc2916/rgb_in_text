@@ -284,3 +284,5 @@ def train(root, directory, variant, seed, resume=False):
         dist.barrier()
     ema_hook.remove()
     dist.destroy_process_group()
+
+
